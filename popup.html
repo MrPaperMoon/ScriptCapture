@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="ru">
+
+<head>
+    <meta charset="utf-8">
+    <link rel="stylesheet" href="popup.css">
+    <title>Watch Together</title>
+</head>
+
+<body>
+    <header><span class="logo">▶</span>
+        <div>
+            <h1>Watch Together</h1><small>Инструмент совместного просмотра фильмов</small>
+        </div>
+    </header>
+    <section id="setup"><label for="link">Комната подключения</label><input id="link" type="url"
+            placeholder="code.avito.ru/r/***">
+        <button id="join">Присоединиться</button>
+        <button id="create" class="secondary">Создать сессию</button>
+        <button id="copy" class="secondary" hidden>Скопировать ссылку</button>
+        <p id="roomNote"></p>
+    </section>
+    <p id="status" role="status"></p>
+    <p id="error" role="alert"></p>
+    <section id="ready" hidden>
+        <h2>Подключение установлено</h2><button id="capture">Capture on site</button>
+        <p id="site"></p>
+    </section>
+    <button id="disconnect" class="secondary" hidden>Отключиться</button>
+    <script type="module" src="popup.js"></script>
+</body>
+
+</html>

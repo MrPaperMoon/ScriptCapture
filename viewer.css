@@ -1,0 +1,36 @@
+:root {
+  color-scheme: dark;
+  font:
+    15px system-ui,
+    sans-serif;
+}
+body {
+  margin: 0;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: #131517;
+  color: #eef1f5;
+}
+header {
+  padding: 12px 20px;
+  border-bottom: 1px solid #343940;
+}
+h1 {
+  font-size: 1rem;
+  margin: 0;
+}
+p {
+  margin: 6px 0;
+  overflow-wrap: anywhere;
+}
+button {
+  padding: 7px 14px;
+  font: inherit;
+}
+iframe {
+  flex: 1;
+  width: 100%;
+  border: 0;
+  background: white;
+}

@@ -1,0 +1,50 @@
+{
+  "manifest_version": 3,
+  "name": "ScriptCapture — Watch Together",
+  "version": "0.4.0",
+  "minimum_chrome_version": "116",
+  "description": "Совместный просмотр через страниц с помощью p2p соединения",
+  "icons": {
+    "16": "icons/tv_gen_18dp_1F1F1F_FILL0_wght400_GRAD0_opsz20.png",
+    "32": "icons/tv_gen_32dp_1F1F1F_FILL0_wght400_GRAD0_opsz40.png",
+    "48": "icons/tv_gen_48dp_1F1F1F_FILL0_wght400_GRAD0_opsz48.png",
+    "128": "icons/tv_gen_128dp_1F1F1F_FILL0_wght400_GRAD0_opsz48.png"
+  },
+  "permissions": [
+    "offscreen",
+    "storage",
+    "tabs",
+    "scripting",
+    "activeTab"
+  ],
+  "host_permissions": [
+    "https://code.avito.ru/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'none'; frame-src 'self'",
+    "sandbox": "sandbox allow-scripts; default-src 'none'; script-src 'self' 'unsafe-inline' data:; style-src 'unsafe-inline' data:; img-src data:; media-src data:; font-src data:; frame-src 'none'; base-uri 'none'; form-action 'none'"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://code.avito.ru/*"
+      ],
+      "js": [
+        "room.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "sandbox": {
+    "pages": [
+      "page-sandbox.html"
+    ]
+  }
+}
