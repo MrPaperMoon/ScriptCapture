@@ -21,18 +21,22 @@ const phaseNames = {
   signaling: 'Signaling',
   connection: 'Connection',
   stable: 'Stable',
+  streaming: 'Streaming',
   reconnecting: 'Reconnecting',
   error: 'Error',
 }
 
-function render({ state, capture, remoteSite, warning, room, roomNote, name }) {
-  const ready = state.phase === 'stable'
+function render({ state, streamingTab, warning, room, roomNote, name }) {
+  const streaming = state.phase === 'streaming'
+  const ready = state.phase === 'stable' || streaming
   const idle = state.phase === 'idle'
 
   status.textContent = phaseNames[state.phase] + ' · ' + name + ' · ' + state.status
   const canCopy = room?.role === 'host' && Boolean(room.url)
-  get('setup').hidden = ready && !canCopy
+  get('setup').hidden = streaming || (ready && !canCopy)
   get('ready').hidden = !ready
+  get('capture').hidden = streaming
+  get('pause').hidden = !streaming
   get('join').hidden = !idle || Boolean(room)
   get('create').hidden = !idle || Boolean(room)
   get('copy').hidden = !canCopy
@@ -43,12 +47,10 @@ function render({ state, capture, remoteSite, warning, room, roomNote, name }) {
 
   get('roomNote').textContent = roomNote || ''
   let hint = 'Capture on site передаёт клики страницы и её прямых iframe.'
-  if (state.isStreamingHost && capture?.pageId) {
-    hint = 'Клики страницы и её прямых iframe передаются получателю.'
-  } else if (remoteSite) {
-    hint = remoteSite.error || (remoteSite.attached
-      ? 'Страница подключена. Клики направляются в страницу или в её iframe.'
-      : 'Ожидаем открытую вкладку сайта.')
+  if (streaming) {
+    hint = streamingTab?.attached && streamingTab.pageId === state.stream.pageId
+      ? 'Оба участника могут управлять страницей. ' + state.stream.url
+      : 'Подключаем вкладку сайта.'
   }
 
   get('site').textContent = warning || hint
@@ -82,7 +84,7 @@ async function act(type) {
   }
 }
 
-for (const id of ['create', 'join', 'capture', 'disconnect']) {
+for (const id of ['create', 'join', 'capture', 'pause', 'disconnect']) {
   get(id).onclick = () => act(id)
 }
 

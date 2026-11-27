@@ -88,6 +88,10 @@ button:disabled {
   background: #293448;
   color: #dce5f5;
 }
+#pause {
+  background: #454950;
+  color: #f0f1f3;
+}
 h2 {
   font-size: 15px;
   margin: 0 0 9px;

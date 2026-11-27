@@ -7,9 +7,11 @@ export class WatchSession {
     onClose = () => {},
     onData = () => {},
     onSite = () => {},
+    onStop = () => {},
     onSent = () => {},
   } = {}) {
     this.onSite = onSite
+    this.onStop = onStop
     this.onSent = onSent
     this.onState = onState
     this.onClose = onClose
@@ -23,13 +25,16 @@ export class WatchSession {
   get negotiating() {
     return this.phase === 'connection' || this.phase === 'reconnecting'
   }
+  get connected() {
+    return this.phase === 'stable' || this.phase === 'streaming'
+  }
   state() {
     return {
       id: this.id,
       session: this.session,
       phase: this.phase,
       status: this.status,
-      isStreamingHost: this.isStreamingHost === true,
+      stream: this.stream ?? null,
       peers: this.peers.size,
       connected: [...this.peers.values()].filter((p) => p.channel?.readyState === 'open').length,
     }
@@ -39,6 +44,20 @@ export class WatchSession {
     this.phase = phase
     this.status = status
     if (changed) this.onState(phase, status)
+  }
+  startStream({ pageId, url }) {
+    this.stream = { pageId, url: webUrl(url) }
+    this.transition('streaming', 'Клики синхронизируются')
+  }
+  endStream() {
+    if (!this.stream) return
+    const { pageId } = this.stream
+    this.stream = null
+    this.onStop(pageId, this.session)
+  }
+  pauseStream() {
+    this.endStream()
+    this.transition('stable', 'Стриминг приостановлен')
   }
   async start({ session, name, host, partner, turn }) {
     if (!isSessionName(session) || ![name, host, partner].every(isName) || name === partner) {
@@ -90,6 +109,7 @@ export class WatchSession {
       return
     }
     this.releasePeer(id)
+    this.endStream()
     this.transition('reconnecting', 'Восстанавливаем соединение через комнату Avito…')
     clearTimeout(this.timer)
     this.timer = setTimeout(() => this.fail('Участник не ответил при восстановлении соединения'), 180000)
@@ -171,14 +191,21 @@ export class WatchSession {
           this.ready()
           return
         }
-        if (this.phase !== 'stable') throw new Error('Команда до старта просмотра')
+        if (!this.connected) throw new Error('Команда до старта просмотра')
         this.validateData(m)
         if (m.type === 'site') {
-          this.isStreamingHost = false
-          this.onSite({ pageId: m.pageId, url: webUrl(m.url), frames: m.frames })
+          // Simultaneous Capture requests converge on the same stream on both peers.
+          if (this.stream && this.stream.pageId <= m.pageId) return
+          this.endStream()
+          this.startStream(m)
+          this.onSite({ ...this.stream, frames: m.frames })
           return
         }
-        if (this.host === this.id) this.broadcast(m, id)
+        if (m.pageId !== this.stream?.pageId) return
+        if (m.type === 'stop') {
+          this.pauseStream()
+          return
+        }
         this.onData(m)
       } catch (e) {
         this.fail(e.message)
@@ -187,6 +214,7 @@ export class WatchSession {
   }
   validateData(m) {
     if (!uuid(m.pageId)) throw new Error('Некорректный идентификатор сайта')
+    if (m.type === 'stop') return
     if (m.type === 'site' || m.type === 'structure') {
       if (m.type === 'site') webUrl(m.url)
       if (!validStructure(m.frames)) throw new Error('Некорректная структура iframe')
@@ -198,13 +226,13 @@ export class WatchSession {
       throw new Error('Неизвестная команда')
     }
   }
-  broadcast(m, except) {
-    const targets = [...this.peers].filter(([id]) => id !== except)
-    if (targets.some(([, p]) => p.channel?.readyState !== 'open' || p.channel.bufferedAmount > 65536))
+  broadcast(m) {
+    if ([...this.peers.values()].some(p => p.channel?.readyState !== 'open' ||
+        (m.type !== 'stop' && p.channel.bufferedAmount > 65536)))
       throw new Error('Канал не готов или перегружен')
     const wire = JSON.stringify(m)
     if (new TextEncoder().encode(wire).length > 65536) throw new Error('Сообщение превышает лимит DataChannel')
-    for (const [to, peer] of targets) {
+    for (const [to, peer] of this.peers) {
       peer.channel.send(wire)
       this.onSent({
         time: new Date().toISOString(),
@@ -216,10 +244,12 @@ export class WatchSession {
     }
   }
   send(m) {
-    if (this.phase !== 'stable') throw new Error('Сначала установите соединение')
+    if (m.type === 'site' ? this.phase !== 'stable' : this.stream?.pageId !== m.pageId)
+      throw new Error('Состояние стриминга изменилось')
     this.validateData(m)
     this.broadcast(m)
-    if (m.type === 'site') this.isStreamingHost = true
+    if (m.type === 'site') this.startStream(m)
+    if (m.type === 'stop') this.pauseStream()
   }
   finish() {
     if (this.host !== this.id || !this.negotiating) throw new Error('Ожидаем создателя комнаты')
@@ -248,6 +278,7 @@ export class WatchSession {
         generation === this.generation + 1
       ) {
         this.releasePeer(m.from)
+        this.endStream()
         this.generation = generation
         this.transition('reconnecting', 'Восстанавливаем соединение через комнату Avito…')
         clearTimeout(this.timer)
@@ -312,7 +343,7 @@ export class WatchSession {
       clearTimeout(p.lostTimer)
       p.pc.close()
     }
-    this.isStreamingHost = false
+    this.endStream()
     this.transition(phase, reason)
     this.outbox = []
     this.seen.clear()

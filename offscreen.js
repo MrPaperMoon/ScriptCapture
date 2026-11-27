@@ -33,7 +33,12 @@ const session = new WatchSession({
     receivedSite = null
     void notify('closed', { session: id })
   },
+  onStop: (pageId, sessionId) => {
+    receivedSite = null
+    void notify('streamStopped', { session: sessionId, pageId })
+  },
   onSite: ({ pageId, url, frames }) => {
+    sentStructure = null
     receivedSite = { pageId, session: session.session, frames, events: [] }
     void notify('remoteSite', { session: session.session, pageId, url })
   },
@@ -63,13 +68,13 @@ async function command(message) {
       break
     case 'disconnect':
       try {
-        if (session.phase === 'stable') session.broadcast({ type: 'bye' })
+        if (session.connected) session.broadcast({ type: 'bye' })
       } finally {
         session.close()
       }
       break
     case 'captureClick': {
-      if (message.session !== session.session || !session.isStreamingHost) return {}
+      if (message.session !== session.session || message.pageId !== session.stream?.pageId) break
       const { pageId, frames, frame, document, event } = message
       const fingerprint = JSON.stringify(frames)
       if (fingerprint !== sentStructure) {
@@ -83,15 +88,17 @@ async function command(message) {
       if (message.session !== session.session) throw new Error('Соединение изменилось')
       session.send({ type: 'site', pageId: message.pageId, url: message.url, frames: message.frames })
       sentStructure = JSON.stringify(message.frames)
-      receivedSite = null
+      receivedSite = { pageId: message.pageId, session: session.session, ready: true, frames: [], events: [] }
       break
     case 'siteReady':
       if (receivedSite?.pageId !== message.pageId || receivedSite.session !== message.session) break
       receivedSite.ready = true
       void replayPending(receivedSite)
       break
-    case 'stopReplay':
-      if (receivedSite?.pageId === message.pageId) receivedSite = null
+    case 'stopStreaming':
+      if (message.session === session.session && message.pageId === session.stream?.pageId) {
+        session.send({ type: 'stop', pageId: message.pageId })
+      }
       break
     case 'roomText':
       try {

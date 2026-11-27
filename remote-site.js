@@ -1,60 +1,29 @@
 import { pointerConfig } from './protocol.js'
 import { attachFrames, detachFrames, resolveFrame, rootContext } from './player-frame.js'
 
-export const getRemoteSite = async () => (await chrome.storage.session.get('remoteSite')).remoteSite
+export const getStreamingTab = async () => (await chrome.storage.session.get('streamingTab')).streamingTab
 
-async function detach(site) {
-  if (site.attached) await detachFrames(site.tabId)
+export async function clearStreamingTab(pageId) {
+  const site = await getStreamingTab()
+  if (!site || (pageId && site.pageId !== pageId)) return
+  await chrome.storage.session.remove('streamingTab')
+  await detachFrames(site.tabId)
 }
 
-export async function clearRemoteSite() {
-  const site = await getRemoteSite()
-  if (!site) return
-  await chrome.storage.session.remove('remoteSite')
-  await detach(site)
-}
-
-export async function openRemoteSite({ pageId, url, session }) {
-  await clearRemoteSite()
-  const { id: tabId } = await chrome.tabs.create({ url })
-  await chrome.storage.session.set({ remoteSite: { tabId, pageId, url, session } })
-  return tabId
-}
-
-export async function stopReplay(site, error) {
-  const { attached, ...opened } = site
-  const stopped = { ...opened, error }
-  await chrome.storage.session.set({ remoteSite: stopped })
-  await detach(site)
-  return stopped
-}
-
-export async function prepareReplay(tabId, change = {}) {
-  const site = await getRemoteSite()
-  if (site?.tabId !== tabId || site.error) return
-  if (site.attached) {
-    if (change.url && change.url !== site.url) {
-      const tab = await chrome.tabs.get(tabId).catch(() => null)
-      if (tab && tab.url !== site.url) {
-        return stopReplay(site, 'Вкладка изменилась. Повторите Capture на исходной странице.')
-      }
-    }
-    return
+export async function bindStreamingTab({ pageId, url, session }, tabId) {
+  await clearStreamingTab()
+  if (tabId === undefined) {
+    const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true })
+    tabId = active?.url === url ? active.id : (await chrome.tabs.create({ url })).id
   }
-  const tab = await chrome.tabs.get(tabId).catch(() => null)
-  if (!tab) return clearRemoteSite()
-  if (tab.url !== site.url) {
-    if (tab.status !== 'complete') return
-    return stopReplay(site, 'Сайт перенаправил вкладку. События указателя приостановлены.')
-  }
+  const site = { tabId, pageId, url, session }
+  await chrome.storage.session.set({ streamingTab: site })
+  return site
+}
 
-  try {
-    await attachFrames(tabId)
-    await chrome.storage.session.set({ remoteSite: { ...site, attached: true } })
-    return site
-  } catch (error) {
-    return stopReplay(site, 'Не удалось подключить воспроизведение: ' + error.message)
-  }
+export async function attachStreamingTab(site) {
+  await attachFrames(site.tabId, site.pageId)
+  await chrome.storage.session.set({ streamingTab: { ...site, attached: true } })
 }
 
 // Executed in the receiving document's isolated world.

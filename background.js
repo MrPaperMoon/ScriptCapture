@@ -1,9 +1,9 @@
 import { webUrl, validFrameResource, validPointer } from './protocol.js'
 import { roomLink, signalLine, readSignals, uuid } from './room-protocol.js'
 import { avitoEditor } from './avito-editor.js'
-import { attachFrames, captureFrameId, clickBinding, detachFrames, readStructure, rootContext } from './player-frame.js'
+import { captureFrameId, clickBinding, readStructure, rootContext } from './player-frame.js'
 import {
-  clearRemoteSite, getRemoteSite, openRemoteSite, prepareReplay, replayRemotePointer, stopReplay,
+  attachStreamingTab, bindStreamingTab, clearStreamingTab, getStreamingTab, replayRemotePointer,
 } from './remote-site.js'
 import { newName, newSessionName } from './identity.js'
 import { isDebuggabel } from './config.js'
@@ -35,7 +35,6 @@ async function rtc(message) {
   return result
 }
 const getRoom = async () => (await chrome.storage.session.get('room')).room
-const getCapture = async () => (await chrome.storage.session.get('capture')).capture
 let siteOperations = Promise.resolve()
 
 function runSiteOperation(operation) {
@@ -44,23 +43,31 @@ function runSiteOperation(operation) {
   return pending
 }
 
-async function updateReplay(tabId, change) {
-  const site = await prepareReplay(tabId, change)
-  if (site) {
-    await rtc({ type: site.error ? 'stopReplay' : 'siteReady', pageId: site.pageId, session: site.session })
+async function stopStreaming({ pageId, session }, warning) {
+  if (warning) await chrome.storage.session.set({ warning })
+  try {
+    await rtc({ type: 'stopStreaming', pageId, session })
+  } finally {
+    await clearStreamingTab(pageId)
   }
 }
 
-async function pauseReplay(site, error) {
-  await stopReplay(site, error)
-  await rtc({ type: 'stopReplay', pageId: site.pageId })
-}
-
-async function clearCapture() {
-  const capture = await getCapture()
-  if (!capture) return
-  await chrome.storage.session.remove('capture')
-  await detachFrames(capture.tabId)
+async function updateStreamingTab(tabId) {
+  const site = await getStreamingTab()
+  if (site?.tabId !== tabId) return
+  const tab = await chrome.tabs.get(tabId).catch(() => null)
+  if (!tab) return stopStreaming(site)
+  if (tab.url !== site.url) {
+    if (!site.attached && (tab.pendingUrl === site.url || tab.status !== 'complete')) return
+    return stopStreaming(site, 'Вкладка перешла на другой URL. Стриминг приостановлен.')
+  }
+  if (site.attached) return
+  try {
+    await attachStreamingTab(site)
+    await rtc({ type: 'siteReady', pageId: site.pageId, session: site.session })
+  } catch (error) {
+    await stopStreaming(site, 'Не удалось подключить вкладку: ' + error.message)
+  }
 }
 async function editor(tabId, operation, text = '') {
   const [result] = await chrome.scripting.executeScript({
@@ -84,19 +91,16 @@ async function shareActivePage() {
       throw new Error('Соединение прервалось')
     if ((await chrome.tabs.get(tab.id)).url !== url)
       throw new Error('Вкладка изменилась во время запуска Capture')
-    await clearCapture()
-    await clearRemoteSite()
     const pageId = crypto.randomUUID()
-    await attachFrames(tab.id, pageId)
+    const site = await bindStreamingTab({ pageId, url, session: state.session }, tab.id)
     try {
+      await attachStreamingTab(site)
       const { frames } = await readStructure(await rootContext(tab.id))
-      await chrome.storage.session.set({
-        capture: { tabId: tab.id, url, pageId, session: state.session },
-      })
+      if ((await chrome.tabs.get(tab.id)).url !== url)
+        throw new Error('Вкладка изменилась во время запуска Capture')
       await rtc({ type: 'shareSite', pageId, url, frames, session: state.session })
     } catch (error) {
-      await clearCapture()
-      await detachFrames(tab.id)
+      await clearStreamingTab(pageId)
       throw error
     }
   })
@@ -107,12 +111,12 @@ async function applyRemoteClick(message) {
   for (let attempt = 0; attempt < 21; attempt++) {
     if (attempt) await new Promise(resolve => setTimeout(resolve, 250))
     const result = await runSiteOperation(async () => {
-      const site = await getRemoteSite()
+      const site = await getStreamingTab()
       if (!site?.attached || site.pageId !== message.pageId || site.session !== message.session) return
       try {
         return await replayRemotePointer(site, message)
       } catch (error) {
-        await pauseReplay(site, 'Воспроизведение остановлено: ' + error.message)
+        await stopStreaming(site, 'Воспроизведение остановлено: ' + error.message)
       }
     })
     if (result !== false) return
@@ -338,7 +342,10 @@ async function handle(m, sender) {
       return {}
     }
     if (m.type === 'debugState' || m.type === 'debugSent') {
-      const labels = { connection: 'Connection', reconnecting: 'Reconnecting', stable: 'Stable', error: 'Error', idle: 'IDLE' }
+      const labels = {
+        connection: 'Connection', reconnecting: 'Reconnecting', stable: 'Stable',
+        streaming: 'Streaming', error: 'Error', idle: 'IDLE',
+      }
       let text = m.text
       if (m.type === 'debugState') text = 'State changed to ' + labels[m.phase] + ' — ' + m.status
       if (m.type === 'debugSent') {
@@ -360,9 +367,12 @@ async function handle(m, sender) {
           await chrome.storage.session.remove(['room', 'roomNote'])
         }
         await chrome.storage.session.remove('warning')
-        await clearCapture()
-        await clearRemoteSite()
+        await clearStreamingTab()
       })
+      return {}
+    }
+    if (m.type === 'streamStopped' && uuid(m.pageId)) {
+      await runSiteOperation(() => clearStreamingTab(m.pageId))
       return {}
     }
     if (m.type === 'remoteSite' && uuid(m.pageId)) {
@@ -370,10 +380,17 @@ async function handle(m, sender) {
       if (roomLink(url)) throw new Error('Адрес комнаты нельзя открыть для просмотра')
       await runSiteOperation(async () => {
         const { state } = await rtc({ type: 'state' })
-        if (state.session !== m.session || state.phase !== 'stable') return
-        await clearCapture()
-        const tabId = await openRemoteSite({ pageId: m.pageId, url, session: m.session })
-        await updateReplay(tabId)
+        if (state.session !== m.session || state.stream?.pageId !== m.pageId) return
+        const stream = { pageId: m.pageId, url, session: m.session }
+        await chrome.storage.session.remove('warning')
+        let site
+        try {
+          site = await bindStreamingTab(stream)
+        } catch (error) {
+          await stopStreaming(stream, 'Не удалось открыть сайт: ' + error.message)
+          return
+        }
+        await updateStreamingTab(site.tabId)
       })
     }
     return {}
@@ -387,12 +404,16 @@ async function handle(m, sender) {
       await chrome.storage.session.set({ warning: error.message })
       throw error
     })
-  }
-  else if (m.type === 'disconnect') {
+  } else if (m.type === 'pause') {
+    await runSiteOperation(async () => {
+      const { state } = await rtc({ type: 'state' })
+      if (state.stream) await stopStreaming({ ...state.stream, session: state.session })
+    })
+  } else if (m.type === 'disconnect') {
     await chrome.storage.session.remove(['room', 'roomNote'])
     await rtc(m)
   } else if (m.type !== 'state') throw new Error('Неизвестная команда')
-  const stored = await chrome.storage.session.get(['capture', 'remoteSite', 'warning', 'room', 'roomNote'])
+  const stored = await chrome.storage.session.get(['streamingTab', 'warning', 'room', 'roomNote'])
   const { state } = await rtc({ type: 'state' })
   if (stored.room?.error) {
     state.phase = 'error'
@@ -418,29 +439,19 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
     await rtc({ type: 'disconnect' }).catch(() => {})
   }
   void runSiteOperation(async () => {
-    const site = await getRemoteSite()
-    if (site?.tabId !== tabId) return
-    await clearRemoteSite()
-    await rtc({ type: 'stopReplay', pageId: site.pageId })
+    const site = await getStreamingTab()
+    if (site?.tabId === tabId) await stopStreaming(site)
   }).catch(console.warn)
 })
 chrome.tabs.onUpdated.addListener((tabId, change) => {
   if (!change.status && !change.url) return
-  void runSiteOperation(async () => {
-    if (change.url) {
-      const capture = await getCapture()
-      if (capture?.tabId === tabId && (await chrome.tabs.get(tabId).catch(() => null))?.url !== capture.url)
-        await clearCapture()
-    }
-    await updateReplay(tabId, change)
-  }).catch(console.warn)
+  void runSiteOperation(() => updateStreamingTab(tabId)).catch(console.warn)
 })
 chrome.debugger.onDetach.addListener(({ tabId }) => {
   void runSiteOperation(async () => {
-    if ((await getCapture())?.tabId === tabId) await clearCapture()
-    const site = await getRemoteSite()
+    const site = await getStreamingTab()
     if (site?.tabId === tabId && site.attached) {
-      await pauseReplay(site, 'Chrome отключил воспроизведение в этой вкладке.')
+      await stopStreaming(site, 'Chrome отключил отладчик. Стриминг приостановлен.')
     }
   }).catch(console.warn)
 })
@@ -451,8 +462,8 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
   const frameId = captureFrameId(source, params.executionContextId)
   if (!frameId) return
   forwardingClicks = forwardingClicks.then(async () => {
-    const capture = await getCapture()
-    if (!capture || source.tabId !== capture.tabId) return
+    const capture = await getStreamingTab()
+    if (!capture?.attached || source.tabId !== capture.tabId) return
     const { pageId, event, document } = JSON.parse(params.payload)
     if (pageId !== capture.pageId || event?.type !== 'click' || !validPointer(event)) return
     if ((await chrome.tabs.get(capture.tabId)).url !== capture.url) return
