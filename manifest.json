@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "ScriptCapture — Watch Together",
   "version": "0.4.0",
-  "minimum_chrome_version": "116",
+  "minimum_chrome_version": "125",
   "description": "Совместный просмотр через страниц с помощью p2p соединения",
   "icons": {
     "16": "icons/tv_gen_18dp_1F1F1F_FILL0_wght400_GRAD0_opsz20.png",
@@ -15,7 +15,8 @@
     "storage",
     "tabs",
     "scripting",
-    "activeTab"
+    "activeTab",
+    "debugger"
   ],
   "host_permissions": [
     "https://code.avito.ru/*"

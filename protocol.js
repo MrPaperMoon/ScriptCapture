@@ -6,37 +6,70 @@ export function webUrl(value) {
     throw new Error('Разрешены только HTTP(S) URL без пароля')
   return url.href
 }
-export function validClick(e) {
-  if (
-    !e ||
-    typeof e.selector !== 'string' ||
-    e.selector.length > 2048 ||
-    !/^(?:#[a-zA-Z_][\w-]{0,79}|[a-z][a-z0-9-]*:nth-child\([1-9]\d*\))(?:>[a-z][a-z0-9-]*:nth-child\([1-9]\d*\)){0,47}$/i.test(
-      e.selector,
-    )
+export const pointerConfig = {
+  types: [
+    'pointerover', 'pointerenter', 'pointerdown', 'pointermove', 'pointerrawupdate', 'pointerup',
+    'pointercancel', 'pointerout', 'pointerleave', 'gotpointercapture', 'lostpointercapture',
+    'click', 'auxclick', 'contextmenu',
+  ],
+  numberArgs: [
+    'button', 'buttons', 'detail', 'pointerId', 'width', 'height', 'pressure', 'tangentialPressure',
+    'tiltX', 'tiltY', 'twist', 'screenX', 'screenY', 'movementX', 'movementY',
+  ],
+  optionalNumberArgs: ['altitudeAngle', 'azimuthAngle'],
+  flagArgs: ['bubbles', 'cancelable', 'composed', 'isPrimary', 'ctrlKey', 'altKey', 'shiftKey', 'metaKey'],
+  // Resource and metadata elements do not count toward a widget's position.
+  skip: 'base,frame,iframe,object,embed,meta,link,script,style,title',
+  excluded: 'a[href],form,input,textarea,select,[contenteditable]:not([contenteditable="false"])',
+  maxDepth: 48,
+}
+
+function validElementPath(path) {
+  return Array.isArray(path) && path.length <= pointerConfig.maxDepth && path.every(step =>
+    Array.isArray(step) && step.length === 3 &&
+    Number.isSafeInteger(step[0]) && step[0] >= 0 &&
+    typeof step[1] === 'string' && step[1].length > 0 && step[1].length <= 80 &&
+    typeof step[2] === 'boolean',
   )
-    return false
-  if (typeof e.frame !== 'string' || e.frame.length > 2048) return false
+}
+
+export function validFrameResource(resource) {
+  if (['about:blank', 'about:srcdoc'].includes(resource)) return true
+  if (typeof resource !== 'string' || resource.length > 2048) return false
   try {
-    const frame = new URL(webUrl(e.frame))
-    if (frame.origin + frame.pathname !== e.frame) return false
+    const url = new URL(webUrl(resource))
+    return resource === url.origin + url.pathname
   } catch {
     return false
   }
-  const unit = (n) => Number.isFinite(n) && n >= 0 && n <= 1
+}
+
+function validFrame(frame) {
+  if (!validElementPath(frame?.path) || frame.path.at(-1)?.[1] !== 'iframe' ||
+      frame.path.some(step => step[2])) return false
+  return validFrameResource(frame.resource)
+}
+
+export function validStructure(frames) {
+  return Array.isArray(frames) && frames.length <= 128 && frames.every(validFrame)
+}
+
+export function validPointer(event) {
+  const args = event?.args
+  const bounded = (value) => Number.isFinite(value) && Math.abs(value) <= Number.MAX_SAFE_INTEGER
   return (
-    typeof e.top === 'boolean' &&
-    typeof e.tag === 'string' &&
-    /^[a-z][a-z0-9-]{0,79}$/i.test(e.tag) &&
-    unit(e.x) &&
-    unit(e.y) &&
-    unit(e.pressure) &&
-    ['mouse', 'touch', 'pen'].includes(e.pointerType) &&
-    Number.isInteger(e.detail) &&
-    e.detail >= 0 &&
-    e.detail <= 255 &&
-    Number.isSafeInteger(e.pointerId) &&
-    typeof e.isPrimary === 'boolean'
+    pointerConfig.types.includes(event?.type) &&
+    validElementPath(event.path) &&
+    (event.relatedPath === null || validElementPath(event.relatedPath)) &&
+    bounded(event.x) &&
+    bounded(event.y) &&
+    Boolean(args) &&
+    typeof args.pointerType === 'string' &&
+    args.pointerType.length <= 32 &&
+    typeof args.hasView === 'boolean' &&
+    pointerConfig.numberArgs.every(key => bounded(args[key])) &&
+    pointerConfig.optionalNumberArgs.every(key => args[key] === undefined || bounded(args[key])) &&
+    pointerConfig.flagArgs.every(key => typeof args[key] === 'boolean')
   )
 }
 export function decodeSignal(text) {

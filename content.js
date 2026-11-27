@@ -1,76 +1,58 @@
-;(() => {
-  if (globalThis.watchClicksInstalled) return
-  globalThis.watchClicksInstalled = true
-  let captureUrl, pageId
-  const topFrame = window === window.top
-  const framePath = () => location.origin + location.pathname
-  const excluded = 'a[href],form,input,textarea,select,[contenteditable]:not([contenteditable="false"])'
+// Chrome creates a fresh isolated world on each document navigation.
+export function captureDocumentClicks(config, binding, pageId) {
+  if (window !== top && parent !== top) return
+  if (globalThis.scriptCapturePageId === pageId || typeof globalThis[binding] !== 'function') return
+  globalThis.scriptCaptureClicks?.abort()
+  const controller = new AbortController()
+  globalThis.scriptCaptureClicks = controller
+  globalThis.scriptCapturePageId = pageId
 
-  function selectorFor(element) {
-    const parts = []
-    for (let node = element; node && parts.length < 48; node = node.parentElement) {
-      if (
-        node.id &&
-        /^[a-zA-Z_][\w-]{0,79}$/.test(node.id) &&
-        document.querySelectorAll('#' + node.id).length === 1
-      ) {
-        parts.unshift('#' + node.id)
-        return parts.join('>')
-      }
-      if (!/^[a-z][a-z0-9-]*$/i.test(node.localName)) return null
-      const siblings = node.parentElement?.children
-      const index = siblings ? Array.prototype.indexOf.call(siblings, node) + 1 : 1
-      parts.unshift(node.localName + ':nth-child(' + index + ')')
-      if (node === document.documentElement) return parts.join('>')
+  function pathTo(element) {
+    if (!(element instanceof Element)) return null
+    const path = []
+    let node = element
+    while (node !== document.documentElement) {
+      const parent = node.parentNode
+      if (!parent?.children || node.matches(config.skip) || path.length === config.maxDepth) return null
+      const index = Array.from(parent.children).filter(child => !child.matches(config.skip)).indexOf(node)
+      if (index < 0) return null
+      const inShadow = parent instanceof ShadowRoot
+      path.unshift([index, node.localName, inShadow])
+      node = inShadow ? parent.host : parent
+      if (!(node instanceof Element)) return null
     }
-    return null
+    return path
   }
-  const fraction = (coordinate, start, length) =>
-    length ? Math.max(0, Math.min(1, (coordinate - start) / length)) : 0.5
 
-  window.addEventListener(
-    'click',
-    (event) => {
-      if (
-        !captureUrl ||
-        (topFrame && location.href !== captureUrl) ||
-        !event.isTrusted ||
-        event.button !== 0 ||
-        event.ctrlKey ||
-        event.altKey ||
-        event.shiftKey ||
-        event.metaKey
-      )
-        return
-      const node = event.target
-      if (!(node instanceof Element) || node.closest(excluded)) return
-      const selector = selectorFor(node)
-      if (!selector) return
-      const rect = node.getBoundingClientRect()
-      const click = {
-        selector,
-        tag: node.localName,
-        frame: framePath(),
-        top: topFrame,
-        x: fraction(event.clientX, rect.left, rect.width),
-        y: fraction(event.clientY, rect.top, rect.height),
-        pointerType: event.pointerType || 'mouse',
-        detail: event.detail,
-        pointerId: event.pointerId ?? 1,
-        isPrimary: event.isPrimary ?? true,
-        pressure: event.pressure ?? 0,
-      }
-      void chrome.runtime
-        .sendMessage({ target: 'background', type: 'click', pageId, event: click })
-        .catch(() => {})
-    },
-    true,
-  )
-
-  chrome.runtime.onMessage.addListener((message) => {
-    if (message.type === 'capture') {
-      captureUrl = message.url
-      pageId = message.pageId
+  window.addEventListener('click', event => {
+    if (!document.documentElement || !(event instanceof PointerEvent) || !event.isTrusted) return
+    const node = event.composedPath()[0]
+    if (!(node instanceof Element)) return
+    for (let ancestor = node; ancestor; ancestor = ancestor.getRootNode().host) {
+      if (ancestor.closest(config.excluded)) return
     }
-  })
-})()
+    const path = pathTo(node)
+    if (!path) return
+    const rect = node.getBoundingClientRect()
+    const args = {}
+    for (const key of config.numberArgs) args[key] = event[key]
+    for (const key of config.optionalNumberArgs) {
+      if (Number.isFinite(event[key])) args[key] = event[key]
+    }
+    for (const key of config.flagArgs) args[key] = event[key]
+    args.pointerType = event.pointerType
+    args.hasView = event.view === window
+    globalThis[binding]?.(JSON.stringify({
+      pageId,
+      document: location.protocol === 'about:' ? location.href : location.origin + location.pathname,
+      event: {
+        type: 'click',
+        path,
+        relatedPath: pathTo(event.relatedTarget),
+        x: (event.clientX - rect.left) / (rect.width || 1),
+        y: (event.clientY - rect.top) / (rect.height || 1),
+        args,
+      },
+    }))
+  }, { capture: true, signal: controller.signal })
+}

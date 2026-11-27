@@ -25,7 +25,7 @@ const phaseNames = {
   error: 'Error',
 }
 
-function render({ state, capture, warning, room, roomNote, name }) {
+function render({ state, capture, remoteSite, warning, room, roomNote, name }) {
   const ready = state.phase === 'stable'
   const idle = state.phase === 'idle'
 
@@ -42,9 +42,14 @@ function render({ state, capture, warning, room, roomNote, name }) {
   if (room) roomInput.value = room.url ?? ''
 
   get('roomNote').textContent = roomNote || ''
-  const hint = state.isStreamingHost && capture?.pageId
-    ? 'Копия отправлена. Клики в исходной вкладке передаются получателю.'
-    : 'Отправьте HTML, скрипты и доступные ресурсы текущей вкладки.'
+  let hint = 'Capture on site передаёт клики страницы и её прямых iframe.'
+  if (state.isStreamingHost && capture?.pageId) {
+    hint = 'Клики страницы и её прямых iframe передаются получателю.'
+  } else if (remoteSite) {
+    hint = remoteSite.error || (remoteSite.attached
+      ? 'Страница подключена. Клики направляются в страницу или в её iframe.'
+      : 'Ожидаем открытую вкладку сайта.')
+  }
 
   get('site').textContent = warning || hint
 }

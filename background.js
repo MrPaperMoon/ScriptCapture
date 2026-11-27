@@ -1,8 +1,10 @@
-import { webUrl, validClick } from './protocol.js'
+import { webUrl, validFrameResource, validPointer } from './protocol.js'
 import { roomLink, signalLine, readSignals, uuid } from './room-protocol.js'
 import { avitoEditor } from './avito-editor.js'
-import { capturePage } from './capture-page.js'
-import { MAX_PAGE_BYTES } from './page-transfer.js'
+import { attachFrames, captureFrameId, clickBinding, detachFrames, readStructure, rootContext } from './player-frame.js'
+import {
+  clearRemoteSite, getRemoteSite, openRemoteSite, prepareReplay, replayRemotePointer, stopReplay,
+} from './remote-site.js'
 import { newName, newSessionName } from './identity.js'
 import { isDebuggabel } from './config.js'
 
@@ -34,6 +36,32 @@ async function rtc(message) {
 }
 const getRoom = async () => (await chrome.storage.session.get('room')).room
 const getCapture = async () => (await chrome.storage.session.get('capture')).capture
+let siteOperations = Promise.resolve()
+
+function runSiteOperation(operation) {
+  const pending = siteOperations.then(operation)
+  siteOperations = pending.catch(() => {})
+  return pending
+}
+
+async function updateReplay(tabId, change) {
+  const site = await prepareReplay(tabId, change)
+  if (site) {
+    await rtc({ type: site.error ? 'stopReplay' : 'siteReady', pageId: site.pageId, session: site.session })
+  }
+}
+
+async function pauseReplay(site, error) {
+  await stopReplay(site, error)
+  await rtc({ type: 'stopReplay', pageId: site.pageId })
+}
+
+async function clearCapture() {
+  const capture = await getCapture()
+  if (!capture) return
+  await chrome.storage.session.remove('capture')
+  await detachFrames(capture.tabId)
+}
 async function editor(tabId, operation, text = '') {
   const [result] = await chrome.scripting.executeScript({
     target: { tabId },
@@ -50,25 +78,49 @@ async function shareActivePage() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true })
   const url = webUrl(tab?.url)
   if (roomLink(url)) throw new Error('Выберите вкладку страницы, которую хотите отправить')
-  const [snapshot] = await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
-    func: capturePage,
-    args: [MAX_PAGE_BYTES],
+  await runSiteOperation(async () => {
+    const connection = (await rtc({ type: 'state' })).state
+    if (connection.session !== state.session || connection.phase !== 'stable')
+      throw new Error('Соединение прервалось')
+    if ((await chrome.tabs.get(tab.id)).url !== url)
+      throw new Error('Вкладка изменилась во время запуска Capture')
+    await clearCapture()
+    await clearRemoteSite()
+    const pageId = crypto.randomUUID()
+    await attachFrames(tab.id, pageId)
+    try {
+      const { frames } = await readStructure(await rootContext(tab.id))
+      await chrome.storage.session.set({
+        capture: { tabId: tab.id, url, pageId, session: state.session },
+      })
+      await rtc({ type: 'shareSite', pageId, url, frames, session: state.session })
+    } catch (error) {
+      await clearCapture()
+      await detachFrames(tab.id)
+      throw error
+    }
   })
-  const page = snapshot?.result
-  if (page?.url !== url || !snapshot.documentId) throw new Error('Не удалось снять копию выбранной страницы')
+}
 
-  // Bind clicks to the captured document. The tab ID survives navigation.
-  const target = { tabId: tab.id, documentIds: [snapshot.documentId] }
-  await chrome.scripting.executeScript({ target, files: ['content.js'] })
-  const pageId = crypto.randomUUID()
-  const result = await rtc({ type: 'sharePage', pageId, page, session: state.session })
-  if (result.state.phase !== 'stable' || result.state.session !== state.session)
-    throw new Error('Соединение прервалось')
-  await chrome.storage.session.set({
-    capture: { tabId: tab.id, documentId: snapshot.documentId, url, pageId },
-  })
-  await chrome.tabs.sendMessage(tab.id, { type: 'capture', url, pageId }, { documentId: snapshot.documentId })
+async function applyRemoteClick(message) {
+  // A click on a player tab can start a new iframe navigation on the receiver.
+  for (let attempt = 0; attempt < 21; attempt++) {
+    if (attempt) await new Promise(resolve => setTimeout(resolve, 250))
+    const result = await runSiteOperation(async () => {
+      const site = await getRemoteSite()
+      if (!site?.attached || site.pageId !== message.pageId || site.session !== message.session) return
+      try {
+        return await replayRemotePointer(site, message)
+      } catch (error) {
+        await pauseReplay(site, 'Воспроизведение остановлено: ' + error.message)
+      }
+    })
+    if (result !== false) return
+  }
+  if (isDebuggabel) {
+    const room = await getRoom()
+    void appendDebug(room, 'Pointer target missing: ' + JSON.stringify(message.event.path))
+  }
 }
 async function openRoom(role, input) {
   const existingRoom = role === 'participant' ? roomLink(input?.trim()) : null
@@ -277,69 +329,70 @@ function appendDebug(room, text) {
 
 async function handle(m, sender) {
   if (sender.tab) {
-    if (m.type === 'roomTick') {
-      await tick(sender)
-      return {}
-    }
-    if (m.type !== 'click' || !validClick(m.event)) return {}
-    const capture = await getCapture()
-    if (
-      !capture ||
-      m.pageId !== capture.pageId ||
-      sender.tab.id !== capture.tabId ||
-      sender.frameId !== 0 ||
-      sender.documentId !== capture.documentId ||
-      sender.url !== capture.url
-    )
-      return {}
-    const url = new URL(sender.url)
-    if (!m.event.top || m.event.frame !== url.origin + url.pathname) return {}
-    await rtc({
-      type: 'send',
-      payload: { type: 'click', pageId: capture.pageId, url: capture.url, event: m.event },
-    })
+    if (m.type === 'roomTick') await tick(sender)
     return {}
   }
   if (sender.url === chrome.runtime.getURL('offscreen.html')) {
-    if (m.type === 'debugState' || m.type === 'debugSent' || m.type === 'debugEvent') {
+    if (m.type === 'remotePointer' && validPointer(m.event)) {
+      await applyRemoteClick(m)
+      return {}
+    }
+    if (m.type === 'debugState' || m.type === 'debugSent') {
       const labels = { connection: 'Connection', reconnecting: 'Reconnecting', stable: 'Stable', error: 'Error', idle: 'IDLE' }
       let text = m.text
       if (m.type === 'debugState') text = 'State changed to ' + labels[m.phase] + ' — ' + m.status
       if (m.type === 'debugSent') {
         const data = m.record.payload
-        if (data.type === 'click') text = 'On click - ' + data.event.selector
-        else if (data.type === 'page') text = 'Sent page ' + data.id + ' (' + data.bytes + ' bytes)'
+        if (data.type === 'pointer') text = 'On ' + data.event.type + ' - ' + JSON.stringify(data.event.path)
+        else if (data.type === 'site') text = 'Sent site ' + data.pageId
+        else if (data.type === 'structure') text = 'Sent frame structure (' + data.frames.length + ' iframes)'
         else text = 'Sent ' + data.type
       }
       await appendDebug(m.room, text)
       return {}
     }
-    const current = (await rtc({ type: 'state' })).state
-    if (current.session && current.session !== m.session) return {}
     if (m.type === 'closed') {
-      const room = await getRoom()
-      if (current.phase === 'idle' && room?.session === m.session) {
-        await chrome.storage.session.remove(['room', 'roomNote'])
-      }
-      await chrome.storage.session.remove(['capture', 'warning'])
+      await runSiteOperation(async () => {
+        const current = (await rtc({ type: 'state' })).state
+        if (current.session && current.session !== m.session) return
+        const room = await getRoom()
+        if (current.phase === 'idle' && room?.session === m.session) {
+          await chrome.storage.session.remove(['room', 'roomNote'])
+        }
+        await chrome.storage.session.remove('warning')
+        await clearCapture()
+        await clearRemoteSite()
+      })
       return {}
     }
-    if (current.phase !== 'stable') return {}
-    if (m.type === 'remotePage' && uuid(m.pageId)) {
-      await chrome.storage.session.remove('capture')
-      await chrome.tabs.create({ url: chrome.runtime.getURL('viewer.html') + '#' + m.pageId })
+    if (m.type === 'remoteSite' && uuid(m.pageId)) {
+      const url = webUrl(m.url)
+      if (roomLink(url)) throw new Error('Адрес комнаты нельзя открыть для просмотра')
+      await runSiteOperation(async () => {
+        const { state } = await rtc({ type: 'state' })
+        if (state.session !== m.session || state.phase !== 'stable') return
+        await clearCapture()
+        const tabId = await openRemoteSite({ pageId: m.pageId, url, session: m.session })
+        await updateReplay(tabId)
+      })
     }
     return {}
   }
   if (sender.url !== chrome.runtime.getURL('popup.html')) throw new Error('Недопустимый источник')
   if (m.type === 'create') await openRoom('host')
   else if (m.type === 'join') await openRoom('participant', m.url)
-  else if (m.type === 'capture') await shareActivePage()
+  else if (m.type === 'capture') {
+    await chrome.storage.session.remove('warning')
+    await shareActivePage().catch(async error => {
+      await chrome.storage.session.set({ warning: error.message })
+      throw error
+    })
+  }
   else if (m.type === 'disconnect') {
     await chrome.storage.session.remove(['room', 'roomNote'])
     await rtc(m)
   } else if (m.type !== 'state') throw new Error('Неизвестная команда')
-  const stored = await chrome.storage.session.get(['capture', 'warning', 'room', 'roomNote'])
+  const stored = await chrome.storage.session.get(['capture', 'remoteSite', 'warning', 'room', 'roomNote'])
   const { state } = await rtc({ type: 'state' })
   if (stored.room?.error) {
     state.phase = 'error'
@@ -364,4 +417,50 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
     await chrome.storage.session.remove(['room', 'roomNote'])
     await rtc({ type: 'disconnect' }).catch(() => {})
   }
+  void runSiteOperation(async () => {
+    const site = await getRemoteSite()
+    if (site?.tabId !== tabId) return
+    await clearRemoteSite()
+    await rtc({ type: 'stopReplay', pageId: site.pageId })
+  }).catch(console.warn)
+})
+chrome.tabs.onUpdated.addListener((tabId, change) => {
+  if (!change.status && !change.url) return
+  void runSiteOperation(async () => {
+    if (change.url) {
+      const capture = await getCapture()
+      if (capture?.tabId === tabId && (await chrome.tabs.get(tabId).catch(() => null))?.url !== capture.url)
+        await clearCapture()
+    }
+    await updateReplay(tabId, change)
+  }).catch(console.warn)
+})
+chrome.debugger.onDetach.addListener(({ tabId }) => {
+  void runSiteOperation(async () => {
+    if ((await getCapture())?.tabId === tabId) await clearCapture()
+    const site = await getRemoteSite()
+    if (site?.tabId === tabId && site.attached) {
+      await pauseReplay(site, 'Chrome отключил воспроизведение в этой вкладке.')
+    }
+  }).catch(console.warn)
+})
+
+let forwardingClicks = Promise.resolve()
+chrome.debugger.onEvent.addListener((source, method, params) => {
+  if (method !== 'Runtime.bindingCalled' || params.name !== clickBinding || params.payload.length > 12000) return
+  const frameId = captureFrameId(source, params.executionContextId)
+  if (!frameId) return
+  forwardingClicks = forwardingClicks.then(async () => {
+    const capture = await getCapture()
+    if (!capture || source.tabId !== capture.tabId) return
+    const { pageId, event, document } = JSON.parse(params.payload)
+    if (pageId !== capture.pageId || event?.type !== 'click' || !validPointer(event)) return
+    if ((await chrome.tabs.get(capture.tabId)).url !== capture.url) return
+    const root = await rootContext(capture.tabId)
+    const { frames, selected } = await readStructure(root, frameId)
+    if (frameId !== root.frameId && (selected === null || !validFrameResource(document))) return
+    await rtc({
+      type: 'captureClick', session: capture.session, pageId, frames, frame: selected, document, event,
+    })
+  }).catch(console.warn)
 })

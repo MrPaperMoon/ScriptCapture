@@ -1,16 +1,15 @@
-import { STUN, decodeSignal, validClick, webUrl } from './protocol.js'
+import { STUN, decodeSignal, validFrameResource, validPointer, validStructure, webUrl } from './protocol.js'
 import { readSignals, isName, isSessionName, uuid } from './room-protocol.js'
-import { beginPage, readPageChunk, sendPage } from './page-transfer.js'
 
 export class WatchSession {
   constructor({
     onState = () => {},
     onClose = () => {},
     onData = () => {},
-    onPage = () => {},
+    onSite = () => {},
     onSent = () => {},
   } = {}) {
-    this.onPage = onPage
+    this.onSite = onSite
     this.onSent = onSent
     this.onState = onState
     this.onClose = onClose
@@ -147,7 +146,6 @@ export class WatchSession {
       return
     }
     p.channel = channel
-    channel.binaryType = 'arraybuffer'
     channel.onopen = () => {
       if (this.peers.get(id) !== p) return
       p.opened = true
@@ -163,17 +161,7 @@ export class WatchSession {
     channel.onmessage = ({ data }) => {
       if (this.peers.get(id) !== p) return
       try {
-        if (data instanceof ArrayBuffer) {
-          if (this.phase !== 'stable') throw new Error('Копия страницы до старта сеанса')
-          const page = readPageChunk(p.pageTransfer, data)
-          if (page) {
-            delete p.pageTransfer
-            this.isStreamingHost = false
-            this.onPage(page)
-          }
-          return
-        }
-        if (typeof data !== 'string' || data.length > 12000) throw new Error('Некорректное сообщение')
+        if (typeof data !== 'string' || data.length > 65536) throw new Error('Некорректное сообщение')
         const m = JSON.parse(data)
         if (m.type === 'bye') {
           this.close('Участник отключился')
@@ -184,11 +172,12 @@ export class WatchSession {
           return
         }
         if (this.phase !== 'stable') throw new Error('Команда до старта просмотра')
-        if (m.type === 'pageBegin') {
-          p.pageTransfer = beginPage(m)
+        this.validateData(m)
+        if (m.type === 'site') {
+          this.isStreamingHost = false
+          this.onSite({ pageId: m.pageId, url: webUrl(m.url), frames: m.frames })
           return
         }
-        this.validateData(m)
         if (this.host === this.id) this.broadcast(m, id)
         this.onData(m)
       } catch (e) {
@@ -197,14 +186,24 @@ export class WatchSession {
     }
   }
   validateData(m) {
-    webUrl(m.url)
-    if (m.type !== 'click' || !uuid(m.pageId) || !validClick(m.event)) throw new Error('Неизвестная команда')
+    if (!uuid(m.pageId)) throw new Error('Некорректный идентификатор сайта')
+    if (m.type === 'site' || m.type === 'structure') {
+      if (m.type === 'site') webUrl(m.url)
+      if (!validStructure(m.frames)) throw new Error('Некорректная структура iframe')
+      return
+    }
+    const validFrame = m.frame === null ||
+      (Number.isInteger(m.frame) && m.frame >= 0 && m.frame < 128 && validFrameResource(m.document))
+    if (m.type !== 'pointer' || !validFrame || m.event?.type !== 'click' || !validPointer(m.event)) {
+      throw new Error('Неизвестная команда')
+    }
   }
   broadcast(m, except) {
     const targets = [...this.peers].filter(([id]) => id !== except)
     if (targets.some(([, p]) => p.channel?.readyState !== 'open' || p.channel.bufferedAmount > 65536))
       throw new Error('Канал не готов или перегружен')
     const wire = JSON.stringify(m)
+    if (new TextEncoder().encode(wire).length > 65536) throw new Error('Сообщение превышает лимит DataChannel')
     for (const [to, peer] of targets) {
       peer.channel.send(wire)
       this.onSent({
@@ -220,27 +219,7 @@ export class WatchSession {
     if (this.phase !== 'stable') throw new Error('Сначала установите соединение')
     this.validateData(m)
     this.broadcast(m)
-  }
-  async sharePage(id, page) {
-    const [target] = this.peers
-    if (this.phase !== 'stable' || !target) throw new Error('Сначала подключите второго участника')
-    if (this.sendingPage) throw new Error('Дождитесь отправки предыдущей копии')
-    this.sendingPage = true
-    try {
-      const [to, peer] = target
-      const session = this.session
-      const bytes = await sendPage(peer.channel, id, page)
-      if (this.session === session && this.phase === 'stable') this.isStreamingHost = true
-      this.onSent({
-        time: new Date().toISOString(),
-        session,
-        from: this.id,
-        to,
-        payload: { type: 'page', id, bytes, omitted: page.omitted },
-      })
-    } finally {
-      this.sendingPage = false
-    }
+    if (m.type === 'site') this.isStreamingHost = true
   }
   finish() {
     if (this.host !== this.id || !this.negotiating) throw new Error('Ожидаем создателя комнаты')
