@@ -91,6 +91,55 @@ button:disabled {
   background: #454950;
   color: #f0f1f3;
 }
+.call-controls,
+.call-inputs {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.call-controls {
+  justify-content: space-between;
+  margin-top: 12px;
+}
+.call-controls button {
+  display: grid;
+  width: 44px;
+  height: 44px;
+  margin: 0;
+  padding: 0;
+  place-items: center;
+  background: #293448;
+}
+.call-controls button[aria-pressed="true"] {
+  box-shadow: inset 0 0 0 1px #a5ebc8;
+}
+#call-video {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 1;
+  overflow: hidden;
+  border-radius: 10px;
+  background: #000;
+}
+#remote-video {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: cover;
+}
+#no-video-signal {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  margin: 0;
+  padding: 20px;
+  background: #000;
+  color: #dce5f5;
+  text-align: center;
+}
 h2 {
   font-size: 15px;
   margin: 0 0 9px;

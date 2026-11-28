@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
   "name": "ScriptCapture — Watch Together",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "minimum_chrome_version": "125",
-  "description": "Совместный просмотр через страниц с помощью p2p соединения",
+  "description": "Смотрите видео вместе, управляйте плеером с любого устройства и общайтесь по аудио или видео.",
   "icons": {
     "16": "icons/smart-display-16.png",
     "32": "icons/smart-display-32.png",
@@ -33,8 +33,7 @@
     }
   },
   "content_security_policy": {
-    "extension_pages": "script-src 'self'; object-src 'none'; frame-src 'self'",
-    "sandbox": "sandbox allow-scripts; default-src 'none'; script-src 'self' 'unsafe-inline' data:; style-src 'unsafe-inline' data:; img-src data:; media-src data:; font-src data:; frame-src 'none'; base-uri 'none'; form-action 'none'"
+    "extension_pages": "script-src 'self'; object-src 'none'; frame-src 'self'"
   },
   "content_scripts": [
     {
@@ -46,10 +45,5 @@
       ],
       "run_at": "document_idle"
     }
-  ],
-  "sandbox": {
-    "pages": [
-      "page-sandbox.html"
-    ]
-  }
+  ]
 }

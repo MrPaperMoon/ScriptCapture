@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="ru">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="stylesheet" href="media-permission.css">
+    <title>Камера и микрофон · Watch Together</title>
+</head>
+<body>
+    <main>
+        <header class="brand">
+            <span><img src="icons/smart-display.svg" width="24" height="24" alt=""></span>
+            Watch Together
+        </header>
+        <h1>Настройте звук и видео</h1>
+        <p class="intro">Разрешите доступ к устройствам, чтобы разговаривать и видеть друг друга во время совместного просмотра.</p>
+        <ul class="devices" aria-label="Устройства для звонка">
+            <li>
+                <span class="device-icon"><img src="icons/mic.svg" width="24" height="24" alt=""></span>
+                <div><h2>Микрофон</h2><p>Передаёт ваш голос собеседнику.</p></div>
+                <span id="audio-status" class="device-status">Проверяем…</span>
+            </li>
+            <li>
+                <span class="device-icon"><img src="icons/camera_video.svg" width="24" height="24" alt=""></span>
+                <div><h2>Камера</h2><p>Показывает ваше видео собеседнику.</p></div>
+                <span id="video-status" class="device-status">Проверяем…</span>
+            </li>
+        </ul>
+        <p class="note">После настройки устройства можно включать и выключать кнопками в расширении.</p>
+        <p id="permission-error" role="alert" hidden></p>
+        <div class="actions">
+            <button id="allow-device" type="button" disabled>Разрешить доступ</button>
+            <button id="skip" type="button">Позже</button>
+        </div>
+    </main>
+    <script type="module" src="media-permission.js"></script>
+</body>
+</html>

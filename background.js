@@ -6,7 +6,6 @@ import {
   attachStreamingTab, bindStreamingTab, clearStreamingTab, getStreamingTab, replayRemotePointer,
 } from './remote-site.js'
 import { newName, newSessionName } from './identity.js'
-import { isDebuggabel } from './config.js'
 
 const identity = chrome.storage.session.get('displayName').then(async ({ displayName }) => {
   if (displayName) return displayName
@@ -22,8 +21,8 @@ async function rtc(message) {
     creating ??= chrome.offscreen
       .createDocument({
         url: 'offscreen.html',
-        reasons: ['WEB_RTC'],
-        justification: 'Keep the WebRTC data connections alive when popup and signaling tab close',
+        reasons: ['WEB_RTC', 'USER_MEDIA', 'AUDIO_PLAYBACK'],
+        justification: 'Keep the WebRTC session, microphone, camera and call audio active outside the popup',
       })
       .finally(() => {
         creating = null
@@ -35,12 +34,48 @@ async function rtc(message) {
   return result
 }
 const getRoom = async () => (await chrome.storage.session.get('room')).room
+const mediaPermissionUrl = chrome.runtime.getURL('media-permission.html')
 let siteOperations = Promise.resolve()
 
 function runSiteOperation(operation) {
   const pending = siteOperations.then(operation)
   siteOperations = pending.catch(() => {})
   return pending
+}
+
+async function openMediaPermissions(intent = null) {
+  const { mediaPermission } = await chrome.storage.session.get('mediaPermission')
+  if (mediaPermission) {
+    const existing = await chrome.windows.get(mediaPermission.windowId).catch(() => null)
+    if (existing) {
+      if (intent) await chrome.storage.session.set({ mediaPermission: { windowId: existing.id, intent } })
+      await chrome.windows.update(existing.id, { focused: true })
+      return
+    }
+  }
+  const window = await chrome.windows.create({
+    url: mediaPermissionUrl, type: 'popup', focused: true, width: 560, height: 620,
+  })
+  await chrome.storage.session.set({ mediaPermission: { windowId: window.id, intent } })
+}
+
+async function finishMediaPermissions(m, sender) {
+  const { mediaPermission } = await chrome.storage.session.get('mediaPermission')
+  if (sender.frameId !== 0 || sender.url !== mediaPermissionUrl || mediaPermission?.windowId !== sender.tab.windowId) {
+    throw new Error('Окно разрешений больше не активно')
+  }
+  const { intent } = mediaPermission
+  if (!m.skip && intent) {
+    if (!Array.isArray(m.granted) || !m.granted.includes(intent.kind)) {
+      throw new Error('Доступ к выбранному устройству ещё не выдан')
+    }
+    const { state } = await rtc({ type: 'state' })
+    if (state.session === intent.session && (state.phase === 'stable' || state.phase === 'streaming')) {
+      await rtc({ type: 'toggleDevice', ...intent, granted: true })
+    }
+  }
+  await chrome.storage.session.remove('mediaPermission')
+  await chrome.windows.remove(mediaPermission.windowId)
 }
 
 async function stopStreaming({ pageId, session }, warning, closeReceiver = false) {
@@ -151,10 +186,6 @@ async function applyRemoteClick(message) {
     })
     if (result !== false) return
   }
-  if (isDebuggabel) {
-    const room = await getRoom()
-    void appendDebug(room, 'Pointer target missing: ' + JSON.stringify(message.event.path))
-  }
 }
 async function openRoom(role, input) {
   const value = typeof input === 'string' ? input.trim() : ''
@@ -215,7 +246,6 @@ async function beginConnection(room, host) {
     name: room.name,
     host: host.from,
     turn,
-    room: { tabId: room.tabId, url: room.url, name: room.name },
   })
 }
 
@@ -269,9 +299,8 @@ async function enrollHost(room, messages) {
       session: previous.session, hostId: previous.id,
     }) : ''
     const line = signalLine({ type: 'host', id: room.id, from: room.name, session: room.sessionName })
-    const log = isDebuggabel ? debugLine(room.name, 'State changed to Signaling') : ''
     const append = room.reuse || room.election
-    const result = await editor(room.tabId, append ? 'append' : 'replace', (append ? '\n' : '') + close + line + log)
+    const result = await editor(room.tabId, append ? 'append' : 'replace', (append ? '\n' : '') + close + line)
     if (result.waiting && (await getRoom())?.id === room.id) {
       delete room.hostWriteRequested
       await chrome.storage.session.set({ room, roomNote: result.message })
@@ -388,7 +417,6 @@ async function tick(sender) {
       await chrome.storage.session.set({ roomNote: error.message })
       return
     }
-    if (!room.session) void appendDebug(room, 'State changed to Error: ' + error.message)
     await chrome.storage.session.set({ room: { ...room, error: error.message }, roomNote: '' })
   } finally {
     ticking = false
@@ -399,47 +427,15 @@ async function tick(sender) {
   }
 }
 
-let debugWrites = Promise.resolve()
-
-function debugLine(name, text) {
-  return '// [' + name + '] ' + text.replace(/[\r\n]/g, ' ').slice(0, 4000) + '\n'
-}
-
-function appendDebug(room, text) {
-  if (!isDebuggabel || !room?.url) return Promise.resolve()
-  debugWrites = debugWrites.then(async () => {
-    const tab = await chrome.tabs.get(room.tabId)
-    if (roomLink(tab.url)?.url !== room.url) return
-    await editor(room.tabId, 'append', '\n' + debugLine(room.name, text))
-  }).catch(error => chrome.storage.session.set({ warning: 'Ошибка записи журнала WebRTC: ' + error.message }))
-  return debugWrites
-}
-
 async function handle(m, sender) {
   if (sender.tab) {
     if (m.type === 'roomTick') await tick(sender)
+    if (m.type === 'finishMediaPermissions') await runSiteOperation(() => finishMediaPermissions(m, sender))
     return {}
   }
   if (sender.url === chrome.runtime.getURL('offscreen.html')) {
     if (m.type === 'remotePointer' && validPointer(m.event)) {
       await applyRemoteClick(m)
-      return {}
-    }
-    if (m.type === 'debugState' || m.type === 'debugSent') {
-      const labels = {
-        signaling: 'Signaling', connection: 'Connection', reconnecting: 'Reconnecting', stable: 'Stable',
-        streaming: 'Streaming', error: 'Error', idle: 'IDLE',
-      }
-      let text = m.text
-      if (m.type === 'debugState') text = 'State changed to ' + labels[m.phase] + ' — ' + m.status
-      if (m.type === 'debugSent') {
-        const data = m.record.payload
-        if (data.type === 'pointer') text = 'On ' + data.event.type + ' - ' + JSON.stringify(data.event.path)
-        else if (data.type === 'site') text = 'Sent site ' + data.pageId
-        else if (data.type === 'structure') text = 'Sent frame structure (' + data.frames.length + ' iframes)'
-        else text = 'Sent ' + data.type
-      }
-      await appendDebug(m.room, text)
       return {}
     }
     if (m.type === 'closed') {
@@ -490,6 +486,21 @@ async function handle(m, sender) {
   if (sender.url !== chrome.runtime.getURL('popup.html')) throw new Error('Недопустимый источник')
   if (m.type === 'create' || m.type === 'join') {
     await runSiteOperation(() => openRoom(m.type === 'create' ? 'host' : 'participant', m.url))
+  } else if (m.type === 'prepareMedia') {
+    await runSiteOperation(async () => {
+      const { mediaSetupSeen } = await chrome.storage.local.get('mediaSetupSeen')
+      if (mediaSetupSeen) return
+      const { permissions } = await rtc({ type: 'mediaPermissions' })
+      if (Object.values(permissions).some(state => state !== 'granted')) await openMediaPermissions()
+      await chrome.storage.local.set({ mediaSetupSeen: true })
+    })
+  } else if (m.type === 'toggleDevice') {
+    await runSiteOperation(async () => {
+      const { permission } = await rtc({ type: 'toggleDevice', kind: m.kind })
+      if (permission) await openMediaPermissions(permission)
+    })
+  } else if (m.type === 'toggleSpeaker') {
+    await rtc({ type: 'toggleSpeaker' })
   } else if (m.type === 'capture') {
     await chrome.storage.session.remove('warning')
     await shareActivePage().catch(async error => {

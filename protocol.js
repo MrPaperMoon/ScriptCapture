@@ -82,7 +82,9 @@ export function decodeSignal(text) {
     !value.sdp.startsWith('v=0')
   )
     throw new Error('Неверный код подключения')
-  if (/^m=(audio|video) /m.test(value.sdp) || !/^m=application /m.test(value.sdp))
-    throw new Error('Разрешён только DataChannel')
+  const media = [...value.sdp.matchAll(/^m=(\S+) /gm)].map(match => match[1])
+  if (!media.includes('application') || new Set(media).size !== media.length ||
+      media.some(kind => !['application', 'audio', 'video'].includes(kind)))
+    throw new Error('Ожидаются DataChannel и до одной дорожки аудио и видео')
   return { type: value.type, sdp: value.sdp }
 }

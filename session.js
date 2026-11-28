@@ -8,14 +8,15 @@ export class WatchSession {
     onData = () => {},
     onSite = () => {},
     onStop = () => {},
-    onSent = () => {},
+    onMedia = () => {},
   } = {}) {
     this.onSite = onSite
     this.onStop = onStop
-    this.onSent = onSent
     this.onState = onState
     this.onClose = onClose
     this.onData = onData
+    this.onMedia = onMedia
+    this.localMedia = {}
     this.peers = new Map()
     this.seen = new Set()
     this.outbox = []
@@ -28,6 +29,52 @@ export class WatchSession {
   get connected() {
     return this.phase === 'stable' || this.phase === 'streaming'
   }
+  get peerConnection() {
+    return this.peers.values().next().value
+  }
+  mediaSender(peer, kind) {
+    return peer?.pc.getTransceivers().find(item => item.receiver.track.kind === kind)
+  }
+  canSendMedia(kind) {
+    const direction = this.mediaSender(this.peerConnection, kind)?.currentDirection
+    return this.connected && (direction === 'sendrecv' || direction === 'sendonly')
+  }
+  remoteTrack(kind) {
+    return this.peerConnection?.remoteMedia[kind] ?? null
+  }
+  async setMedia(kind, track) {
+    const peer = this.peerConnection
+    const previous = this.localMedia[kind]
+    if (!track) {
+      previous?.stop()
+      delete this.localMedia[kind]
+      this.mediaChanged(kind)
+    } else if (!this.canSendMedia(kind)) {
+      throw new Error('Медиа недоступно в текущем соединении')
+    }
+    await this.mediaSender(peer, kind)?.sender.replaceTrack(track)
+    if (!track) return
+    if (peer !== this.peerConnection || !this.connected) throw new Error('Соединение изменилось')
+    previous?.stop()
+    this.localMedia[kind] = track
+    track.onended = () => {
+      if (this.localMedia[kind] === track) void this.setMedia(kind, null).catch(console.warn)
+    }
+    this.mediaChanged(kind)
+  }
+  mediaChanged(kind) {
+    this.onMedia()
+    if (kind === 'video' && this.connected) this.sendCameraState()
+  }
+  sendCameraState() {
+    const peer = this.peerConnection
+    if (this.mediaSender(peer, 'video')?.currentDirection !== 'sendrecv' || peer.channel?.readyState !== 'open') return
+    try {
+      this.broadcast({ type: 'camera', enabled: Boolean(this.localMedia.video) })
+    } catch (error) {
+      console.warn(error)
+    }
+  }
   state() {
     return {
       id: this.id,
@@ -37,6 +84,11 @@ export class WatchSession {
       stream: this.stream ?? null,
       peers: this.peers.size,
       connected: [...this.peers.values()].filter((p) => p.channel?.readyState === 'open').length,
+      media: {
+        microphone: Boolean(this.localMedia.audio), camera: Boolean(this.localMedia.video),
+        remoteCamera: Boolean(this.peerConnection?.remoteCamera),
+        audioAvailable: this.canSendMedia('audio'), videoAvailable: this.canSendMedia('video'),
+      },
     }
   }
   transition(phase, status) {
@@ -83,6 +135,10 @@ export class WatchSession {
   }
   async offer(partner) {
     const peer = this.peer(partner, true)
+    for (const kind of ['audio', 'video']) {
+      const { sender } = peer.pc.addTransceiver(kind)
+      if (this.localMedia[kind]) await sender.replaceTrack(this.localMedia[kind])
+    }
     await peer.pc.setLocalDescription(await peer.pc.createOffer())
     if (this.peers.get(partner) === peer) {
       this.publishDescription(partner, peer, 'offer')
@@ -113,6 +169,7 @@ export class WatchSession {
     clearTimeout(previous.timer)
     clearTimeout(previous.lostTimer)
     previous.pc.close()
+    this.onMedia()
   }
   recover(id, peer, reason) {
     if (this.peers.get(id) !== peer || peer.closing) return
@@ -135,8 +192,13 @@ export class WatchSession {
   peer(id, initiator) {
     if (this.peers.size) throw new Error('Оба места заняты')
     const pc = new RTCPeerConnection(this.rtcConfig),
-      p = { pc, candidates: [], localCandidates: [], channel: null }
+      p = { pc, candidates: [], localCandidates: [], channel: null, remoteMedia: {} }
     this.peers.set(id, p)
+    pc.ontrack = ({ track }) => {
+      if (this.peers.get(id) !== p) return
+      p.remoteMedia[track.kind] = track
+      this.onMedia()
+    }
     p.timer = setTimeout(() => {
       if (this.peers.get(id) === p)
         this.connectionFailed('Участник не подключился за 3 минуты. Попробуйте новую комнату или TURN')
@@ -207,6 +269,11 @@ export class WatchSession {
           return
         }
         if (!this.connected) throw new Error('Команда до старта просмотра')
+        if (m.type === 'camera' && typeof m.enabled === 'boolean') {
+          p.remoteCamera = m.enabled
+          this.onMedia()
+          return
+        }
         this.validateData(m)
         if (m.type === 'site') {
           // Simultaneous Capture requests converge on the same stream on both peers.
@@ -243,20 +310,11 @@ export class WatchSession {
   }
   broadcast(m) {
     if ([...this.peers.values()].some(p => p.channel?.readyState !== 'open' ||
-        (!['stop', 'bye'].includes(m.type) && p.channel.bufferedAmount > 65536)))
+        (!['stop', 'bye', 'camera'].includes(m.type) && p.channel.bufferedAmount > 65536)))
       throw new Error('Канал не готов или перегружен')
     const wire = JSON.stringify(m)
     if (new TextEncoder().encode(wire).length > 65536) throw new Error('Сообщение превышает лимит DataChannel')
-    for (const [to, peer] of this.peers) {
-      peer.channel.send(wire)
-      this.onSent({
-        time: new Date().toISOString(),
-        session: this.session,
-        from: this.id,
-        to,
-        payload: JSON.parse(wire),
-      })
-    }
+    for (const peer of this.peers.values()) peer.channel.send(wire)
   }
   send(m) {
     if (m.type === 'site' ? this.phase !== 'stable' : this.stream?.pageId !== m.pageId)
@@ -275,6 +333,7 @@ export class WatchSession {
   ready() {
     clearTimeout(this.timer)
     this.transition('stable', 'Соединение установлено')
+    this.sendCameraState()
   }
   async receive(text) {
     if (!this.session || this.phase === 'error') return
@@ -322,6 +381,12 @@ export class WatchSession {
         p ??= this.peer(m.from, false)
         await p.pc.setRemoteDescription(decodeSignal(JSON.stringify({ v: 1, ...m.description })))
         if (this.peers.get(m.from) !== p) return
+        for (const transceiver of p.pc.getTransceivers()) {
+          if (transceiver.stopped || !['audio', 'video'].includes(transceiver.receiver.track.kind)) continue
+          transceiver.direction = 'sendrecv'
+          const track = this.localMedia[transceiver.receiver.track.kind]
+          if (track) await transceiver.sender.replaceTrack(track)
+        }
         this.partner = m.from
         if (this.phase === 'signaling') this.transition('connection', 'Устанавливаем соединение')
         for (const c of p.candidates) await p.pc.addIceCandidate(c)
@@ -387,6 +452,8 @@ export class WatchSession {
     const hadAnswer = phase === 'error' && this.host !== this.id &&
       Boolean(this.peers.get(this.host)?.pc.remoteDescription)
     clearTimeout(this.timer)
+    for (const track of Object.values(this.localMedia)) track.stop()
+    this.localMedia = {}
     for (const id of this.peers.keys()) this.releasePeer(id)
     this.endStream()
     this.transition(phase, reason)

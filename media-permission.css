@@ -1,0 +1,94 @@
+:root {
+  color-scheme: dark;
+  font-family: system-ui, sans-serif;
+  color: #edf0f7;
+  background: #11151e;
+}
+* { box-sizing: border-box; }
+body {
+  min-height: 100vh;
+  margin: 0;
+  padding: clamp(20px, 6vw, 36px);
+  display: grid;
+  place-items: center;
+  background: radial-gradient(ellipse at top left, #203b36 0, #11151e 58%);
+}
+main { width: min(100%, 480px); }
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 15px;
+  font-weight: 650;
+}
+.brand span,
+.device-icon {
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  border-radius: 12px;
+}
+.brand span { background: #a5ebc8; }
+h1 {
+  margin: 24px 0 8px;
+  font-size: clamp(24px, 6vw, 32px);
+  line-height: 1.15;
+  letter-spacing: -.025em;
+}
+p { margin: 0; line-height: 1.5; }
+.intro, .note, .devices p { color: #afbdd2; }
+.intro { font-size: 15px; }
+.devices {
+  display: grid;
+  gap: 10px;
+  list-style: none;
+  padding: 0;
+  margin: 22px 0 16px;
+}
+.devices li {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid #2c374b;
+  border-radius: 14px;
+  background: #1b2230;
+}
+.device-icon { background: #293448; }
+h2 { margin: 0 0 3px; font-size: 15px; }
+.devices p, .note { font-size: 13px; }
+.device-status {
+  justify-self: start;
+  padding: 4px 8px;
+  border-radius: 7px;
+  background: #293448;
+  color: #dce5f5;
+  font-size: 11px;
+  white-space: nowrap;
+}
+.device-status[data-status="granted"] { background: #1f3b34; color: #a5ebc8; }
+.device-status[data-status="denied"] { background: #3d2830; color: #ffb0a9; }
+#permission-error { color: #ffb0a9; margin-top: 12px; font-size: 13px; }
+.actions { display: flex; gap: 12px; margin-top: 20px; }
+button {
+  min-height: 42px;
+  padding: 10px 16px;
+  border: 0;
+  border-radius: 8px;
+  background: #a5ebc8;
+  color: #142c23;
+  font: inherit;
+  font-size: 14px;
+  font-weight: 650;
+  cursor: pointer;
+}
+#skip { background: #293448; color: #dce5f5; }
+button:hover { filter: brightness(1.08); }
+button:disabled { opacity: .55; cursor: wait; }
+button:focus-visible { outline: 2px solid #edf0f7; outline-offset: 3px; }
+@media (max-width: 390px) {
+  .devices li { grid-template-columns: auto minmax(0, 1fr); }
+  .device-status { grid-column: 2; }
+}

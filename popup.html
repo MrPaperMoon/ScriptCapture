@@ -24,6 +24,17 @@
     <p id="error" role="alert"></p>
     <section id="ready" hidden>
         <h2>Подключение установлено</h2>
+        <div id="call-video" hidden>
+            <video id="remote-video" autoplay muted playsinline aria-label="Камера собеседника"></video>
+            <p id="no-video-signal" role="status">Нет видеосигнала от собеседника</p>
+        </div>
+        <div class="call-controls" role="group" aria-label="Управление звонком">
+            <div class="call-inputs">
+                <button id="microphone" type="button" aria-label="Микрофон" aria-pressed="false"><img width="24" height="24" src="icons/mic_off.svg" alt=""></button>
+                <button id="camera" type="button" aria-label="Камера" aria-pressed="false"><img width="24" height="24" src="icons/camera_video_off.svg" alt=""></button>
+            </div>
+            <button id="speaker" type="button" aria-label="Звук собеседника" aria-pressed="true"><img width="24" height="24" src="icons/volume_up.svg" alt=""></button>
+        </div>
         <button id="capture">Capture on site</button>
         <button id="pause" hidden>Приостановить стриминг</button>
         <p id="site"></p>

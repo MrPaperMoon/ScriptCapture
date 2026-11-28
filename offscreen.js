@@ -1,11 +1,24 @@
-import { isDebuggabel } from './config.js'
 import { WatchSession } from './session.js'
+import { captureDevice, deviceName, devicePermission, devicePermissions } from './media-devices.js'
+import { previewPort, servePreview } from './media-preview.js'
 
 const notify = (type, data = {}) =>
   chrome.runtime.sendMessage({ target: 'background', ...data, type }).catch(() => {})
-let debugRoom
 let receivedSite
 let sentStructure
+const remoteAudio = document.getElementById('remote-audio')
+const previews = new Map()
+let audioTrack
+
+function updateMedia() {
+  const next = session.remoteTrack('audio')
+  if (next !== audioTrack) {
+    audioTrack = next
+    remoteAudio.srcObject = next ? new MediaStream([next]) : null
+    if (next) void remoteAudio.play().catch(console.warn)
+  }
+  for (const refresh of previews.values()) void refresh().catch(console.warn)
+}
 
 async function replayPending(site) {
   if (!site.ready || site.replaying) return
@@ -22,12 +35,9 @@ async function replayPending(site) {
 }
 
 const session = new WatchSession({
-  onState: (phase, status) => {
+  onMedia: updateMedia,
+  onState: () => {
     sentStructure = null
-    if (isDebuggabel && debugRoom) void notify('debugState', { phase, status, room: debugRoom })
-  },
-  onSent: (record) => {
-    if (isDebuggabel) void notify('debugSent', { record, room: debugRoom })
   },
   onClose: (id, hadAnswer) => {
     receivedSite = null
@@ -56,10 +66,38 @@ const session = new WatchSession({
     void replayPending(site)
   },
 })
+chrome.runtime.onConnect.addListener((port) => {
+  if (port.name !== previewPort || port.sender?.url !== chrome.runtime.getURL('popup.html')) return
+  const refresh = servePreview(port, () => session.remoteTrack('video'), () => previews.delete(port))
+  previews.set(port, refresh)
+})
+
+async function toggleDevice(kind, expectedSession, granted) {
+  if (!Object.hasOwn(deviceName, kind) || !session.canSendMedia(kind) ||
+      (expectedSession && session.session !== expectedSession)) throw new Error('Соединение изменилось')
+  if (session.localMedia[kind]) {
+    if (!granted) await session.setMedia(kind, null)
+    return
+  }
+  const current = session.session
+  if (!granted && await devicePermission(kind) !== 'granted') return { kind, session: current }
+  let track
+  try {
+    track = await captureDevice(kind)
+    if (session.session !== current) throw new Error('Соединение изменилось')
+    await session.setMedia(kind, track)
+  } catch (error) {
+    track?.stop()
+    if (!granted && error.name === 'NotAllowedError') return { kind, session: current }
+    if (error.name === 'NotFoundError') throw new Error('Устройство не найдено: ' + deviceName[kind])
+    throw error
+  }
+}
+
 async function command(message) {
+  let permission
   switch (message.type) {
     case 'start':
-      debugRoom = message.room
       try {
         await session.start(message)
       } catch (error) {
@@ -123,13 +161,25 @@ async function command(message) {
     case 'ack':
       session.outbox = session.outbox.filter((item) => !message.ids.includes(item.id))
       break
+    case 'toggleDevice':
+      permission = await toggleDevice(message.kind, message.session, message.granted)
+      break
+    case 'mediaPermissions':
+      return { permissions: await devicePermissions() }
+    case 'toggleSpeaker':
+      if (!session.connected) throw new Error('Нет соединения')
+      remoteAudio.muted = !remoteAudio.muted
+      if (!remoteAudio.muted && audioTrack) await remoteAudio.play()
+      break
     case 'state':
       break
     default:
       throw new Error('Неизвестная команда')
   }
 
-  return { state: session.state(), outbox: session.outbox }
+  const state = session.state()
+  state.media.speaker = !remoteAudio.muted
+  return { state, outbox: session.outbox, permission }
 }
 
 let serial = Promise.resolve()
