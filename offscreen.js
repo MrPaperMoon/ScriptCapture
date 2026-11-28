@@ -10,7 +10,7 @@ let sentStructure
 async function replayPending(site) {
   if (!site.ready || site.replaying) return
   site.replaying = true
-  while (receivedSite === site && site.events.length) {
+  while (receivedSite === site && site.ready && site.events.length) {
     const click = site.events.shift()
     await notify('remotePointer', {
       pageId: site.pageId,
@@ -29,13 +29,13 @@ const session = new WatchSession({
   onSent: (record) => {
     if (isDebuggabel) void notify('debugSent', { record, room: debugRoom })
   },
-  onClose: (id) => {
+  onClose: (id, hadAnswer) => {
     receivedSite = null
-    void notify('closed', { session: id })
+    void notify('closed', { session: id, hadAnswer })
   },
-  onStop: (pageId, sessionId) => {
+  onStop: (pageId, sessionId, closeReceiver) => {
     receivedSite = null
-    void notify('streamStopped', { session: sessionId, pageId })
+    void notify('streamStopped', { session: sessionId, pageId, closeReceiver })
   },
   onSite: ({ pageId, url, frames }) => {
     sentStructure = null
@@ -49,6 +49,7 @@ const session = new WatchSession({
       site.frames = message.frames
       return
     }
+    if (site.suspended) return
     const frame = message.frame === null ? null : site.frames[message.frame]
     if (frame === undefined) return
     if (site.events.length < 256) site.events.push({ frame, document: message.document, event: message.event })
@@ -70,7 +71,7 @@ async function command(message) {
       try {
         if (session.connected) session.broadcast({ type: 'bye' })
       } finally {
-        session.close()
+        await session.disconnect()
       }
       break
     case 'captureClick': {
@@ -90,24 +91,35 @@ async function command(message) {
       sentStructure = JSON.stringify(message.frames)
       receivedSite = { pageId: message.pageId, session: session.session, ready: true, frames: [], events: [] }
       break
+    case 'siteUnavailable':
+      if (receivedSite?.pageId !== message.pageId || receivedSite.session !== message.session) break
+      receivedSite.suspended = true
+      receivedSite.ready = false
+      receivedSite.events.length = 0
+      sentStructure = null
+      break
     case 'siteReady':
       if (receivedSite?.pageId !== message.pageId || receivedSite.session !== message.session) break
+      receivedSite.suspended = false
       receivedSite.ready = true
       void replayPending(receivedSite)
       break
     case 'stopStreaming':
       if (message.session === session.session && message.pageId === session.stream?.pageId) {
-        session.send({ type: 'stop', pageId: message.pageId })
+        session.send({ type: 'stop', pageId: message.pageId, closeReceiver: message.closeReceiver })
       }
       break
-    case 'roomText':
+    case 'roomText': {
+      const current = session.session
       try {
         await session.receive(message.text)
       } catch (error) {
+        if (session.session !== current) break
         session.fail(error.message)
         throw error
       }
       break
+    }
     case 'ack':
       session.outbox = session.outbox.filter((item) => !message.ids.includes(item.id))
       break

@@ -1,12 +1,21 @@
+import { roomLink } from './room-protocol.js'
+
 const get = (id) => document.getElementById(id)
 const roomInput = get('link')
 const status = get('status')
 const errorMessage = get('error')
 const buttons = document.querySelectorAll('button')
 let working = false
+let roomUrl = ''
+let linkEdited = false
+
+roomInput.oninput = () => { linkEdited = true }
+void chrome.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
+  if (!linkEdited) roomInput.value = roomLink(tab?.url)?.url ?? ''
+}).catch(console.warn)
 
 async function request(type) {
-  const url = type === 'join' ? roomInput.value : undefined
+  const url = type === 'join' || type === 'create' ? roomInput.value : undefined
   const response = await chrome.runtime.sendMessage({ target: 'background', type, url })
 
   if (!response?.ok) {
@@ -30,27 +39,24 @@ function render({ state, streamingTab, warning, room, roomNote, name }) {
   const streaming = state.phase === 'streaming'
   const ready = state.phase === 'stable' || streaming
   const idle = state.phase === 'idle'
+  const signaling = state.phase === 'signaling'
 
   status.textContent = phaseNames[state.phase] + ' · ' + name + ' · ' + state.status
-  const canCopy = room?.role === 'host' && Boolean(room.url)
-  get('setup').hidden = streaming || (ready && !canCopy)
+  const canCopy = Boolean(room?.url) && (signaling || room.role === 'host')
+  roomUrl = room?.url ?? ''
+  get('setup').hidden = !idle || Boolean(room)
   get('ready').hidden = !ready
   get('capture').hidden = streaming
   get('pause').hidden = !streaming
-  get('join').hidden = !idle || Boolean(room)
-  get('create').hidden = !idle || Boolean(room)
-  get('copy').hidden = !canCopy
+  get('copy').hidden = streaming || !canCopy
   get('disconnect').hidden = !room && idle
 
-  roomInput.readOnly = Boolean(room)
-  if (room) roomInput.value = room.url ?? ''
-
-  get('roomNote').textContent = roomNote || ''
-  let hint = 'Capture on site передаёт клики страницы и её прямых iframe.'
+  get('roomNote').textContent = streaming ? '' : roomNote || ''
+  let hint = 'Смотрите видео вместе и управляйте просмотром с любого устройства.'
   if (streaming) {
     hint = streamingTab?.attached && streamingTab.pageId === state.stream.pageId
       ? 'Оба участника могут управлять страницей. ' + state.stream.url
-      : 'Подключаем вкладку сайта.'
+      : 'Ждём загрузки страницы…'
   }
 
   get('site').textContent = warning || hint
@@ -90,7 +96,7 @@ for (const id of ['create', 'join', 'capture', 'pause', 'disconnect']) {
 
 get('copy').onclick = async () => {
   try {
-    await navigator.clipboard.writeText(roomInput.value)
+    await navigator.clipboard.writeText(roomUrl)
     get('roomNote').textContent = 'Ссылка скопирована'
   } catch (error) {
     errorMessage.textContent = error.message

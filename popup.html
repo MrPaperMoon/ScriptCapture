@@ -8,18 +8,18 @@
 </head>
 
 <body>
-    <header><span class="logo">▶</span>
+    <header><span class="logo"><img src="icons/smart-display.svg" width="24" height="24" alt=""></span>
         <div>
             <h1>Watch Together</h1><small>Инструмент совместного просмотра фильмов</small>
         </div>
     </header>
-    <section id="setup"><label for="link">Комната подключения</label><input id="link" type="url"
+    <section id="setup"><label id="link-label" for="link">Комната подключения</label><input id="link" type="url"
             placeholder="code.avito.ru/r/***">
         <button id="join">Присоединиться</button>
         <button id="create" class="secondary">Создать сессию</button>
-        <button id="copy" class="secondary" hidden>Скопировать ссылку</button>
-        <p id="roomNote"></p>
     </section>
+    <button id="copy" class="secondary" hidden>Скопировать ссылку</button>
+    <p id="roomNote"></p>
     <p id="status" role="status"></p>
     <p id="error" role="alert"></p>
     <section id="ready" hidden>

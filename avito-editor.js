@@ -68,11 +68,5 @@ export async function avitoEditor(operation, text = '') {
       })
     })
   }
-  const result = { text: component.doc.data, url: location.href }
-  if (operation === 'readForJoin') {
-    // On join the displayed Host can be available before it appears in the room snapshot.
-    result.visibleHost = model.getValue().split(/\r?\n/)
-      .findLast(line => line.length <= 1024 && /^\s*\[[^\]]+\]\s+Host\s*:/.test(line))
-  }
-  return result
+  return { text: component.doc.data, url: location.href }
 }

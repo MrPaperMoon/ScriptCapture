@@ -3,27 +3,34 @@ import { attachFrames, detachFrames, resolveFrame, rootContext } from './player-
 
 export const getStreamingTab = async () => (await chrome.storage.session.get('streamingTab')).streamingTab
 
-export async function clearStreamingTab(pageId) {
+export async function clearStreamingTab(pageId, closeReceiver = false) {
   const site = await getStreamingTab()
   if (!site || (pageId && site.pageId !== pageId)) return
   await chrome.storage.session.remove('streamingTab')
   await detachFrames(site.tabId)
+  if (closeReceiver && site.receiver) {
+    const tab = await chrome.tabs.get(site.tabId).catch(() => null)
+    if (tab?.url === site.url && (!tab.pendingUrl || tab.pendingUrl === site.url)) {
+      await chrome.tabs.remove(site.tabId)
+    }
+  }
 }
 
 export async function bindStreamingTab({ pageId, url, session }, tabId) {
   await clearStreamingTab()
-  if (tabId === undefined) {
+  const receiver = tabId === undefined
+  if (receiver) {
     const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true })
     tabId = active?.url === url ? active.id : (await chrome.tabs.create({ url })).id
   }
-  const site = { tabId, pageId, url, session }
+  const site = { tabId, pageId, url, session, receiver }
   await chrome.storage.session.set({ streamingTab: site })
   return site
 }
 
 export async function attachStreamingTab(site) {
   await attachFrames(site.tabId, site.pageId)
-  await chrome.storage.session.set({ streamingTab: { ...site, attached: true } })
+  await chrome.storage.session.set({ streamingTab: { ...site, attachment: crypto.randomUUID(), attached: true } })
 }
 
 // Executed in the receiving document's isolated world.
@@ -88,7 +95,9 @@ export async function replayRemotePointer(site, { event, frame, document }) {
     })
     return result?.value === true
   } catch (error) {
-    if (/context|session.*not found|frame.*not found|inspected target navigated/i.test(error.message)) return false
+    if (/context|session.*not found|frame.*not found|inspected target navigated|target closed|debugger is not attached/i.test(error.message)) {
+      return false
+    }
     throw error
   }
 }

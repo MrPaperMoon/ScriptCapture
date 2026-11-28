@@ -1,7 +1,7 @@
 import { webUrl, validFrameResource, validPointer } from './protocol.js'
 import { roomLink, signalLine, readSignals, uuid } from './room-protocol.js'
 import { avitoEditor } from './avito-editor.js'
-import { captureFrameId, clickBinding, readStructure, rootContext } from './player-frame.js'
+import { captureFrameId, clickBinding, detachFrames, readStructure, rootContext } from './player-frame.js'
 import {
   attachStreamingTab, bindStreamingTab, clearStreamingTab, getStreamingTab, replayRemotePointer,
 } from './remote-site.js'
@@ -43,29 +43,55 @@ function runSiteOperation(operation) {
   return pending
 }
 
-async function stopStreaming({ pageId, session }, warning) {
+async function stopStreaming({ pageId, session }, warning, closeReceiver = false) {
   if (warning) await chrome.storage.session.set({ warning })
   try {
-    await rtc({ type: 'stopStreaming', pageId, session })
+    await rtc({ type: 'stopStreaming', pageId, session, closeReceiver })
   } finally {
-    await clearStreamingTab(pageId)
+    await clearStreamingTab(pageId, closeReceiver)
   }
+}
+
+async function disconnectRoom() {
+  const room = await getRoom()
+  await chrome.storage.session.remove(['room', 'roomNote'])
+  try {
+    const { state } = await rtc({ type: 'state' })
+    if (room?.role === 'host' || ['stable', 'streaming', 'reconnecting'].includes(state.phase)) {
+      await recordHostLeft(room)
+    }
+    await rtc({ type: 'disconnect' })
+  } finally {
+    await clearStreamingTab()
+  }
+}
+
+async function suspendStreamingTab(site, tabId = site.tabId) {
+  await chrome.storage.session.set({ streamingTab: { ...site, tabId, attached: false } })
+  await detachFrames(site.tabId)
+  await rtc({ type: 'siteUnavailable', pageId: site.pageId, session: site.session })
 }
 
 async function updateStreamingTab(tabId) {
   const site = await getStreamingTab()
   if (site?.tabId !== tabId) return
   const tab = await chrome.tabs.get(tabId).catch(() => null)
-  if (!tab) return stopStreaming(site)
+  if (!tab) return
+  if (tab.discarded) {
+    if (site.attached) await suspendStreamingTab(site)
+    return
+  }
   if (tab.url !== site.url) {
     if (!site.attached && (tab.pendingUrl === site.url || tab.status !== 'complete')) return
     return stopStreaming(site, 'Вкладка перешла на другой URL. Стриминг приостановлен.')
   }
-  if (site.attached) return
+  if (site.attached || tab.status !== 'complete' || tab.pendingUrl) return
   try {
     await attachStreamingTab(site)
     await rtc({ type: 'siteReady', pageId: site.pageId, session: site.session })
   } catch (error) {
+    const current = await chrome.tabs.get(tabId).catch(() => null)
+    if (!current || current.discarded || current.status !== 'complete') return
     await stopStreaming(site, 'Не удалось подключить вкладку: ' + error.message)
   }
 }
@@ -108,15 +134,19 @@ async function shareActivePage() {
 
 async function applyRemoteClick(message) {
   // A click on a player tab can start a new iframe navigation on the receiver.
+  let attachment
   for (let attempt = 0; attempt < 21; attempt++) {
     if (attempt) await new Promise(resolve => setTimeout(resolve, 250))
     const result = await runSiteOperation(async () => {
       const site = await getStreamingTab()
-      if (!site?.attached || site.pageId !== message.pageId || site.session !== message.session) return
+      if (!site?.attached || site.pageId !== message.pageId || site.session !== message.session ||
+          (attachment && site.attachment !== attachment)) return
+      attachment = site.attachment
       try {
         return await replayRemotePointer(site, message)
       } catch (error) {
-        await stopStreaming(site, 'Воспроизведение остановлено: ' + error.message)
+        const tab = await chrome.tabs.get(site.tabId).catch(() => null)
+        if (tab && !tab.discarded) await stopStreaming(site, 'Воспроизведение остановлено: ' + error.message)
       }
     })
     if (result !== false) return
@@ -127,8 +157,9 @@ async function applyRemoteClick(message) {
   }
 }
 async function openRoom(role, input) {
-  const existingRoom = role === 'participant' ? roomLink(input?.trim()) : null
-  if (role === 'participant' && !existingRoom) {
+  const value = typeof input === 'string' ? input.trim() : ''
+  const existingRoom = roomLink(value)
+  if (!existingRoom && (value || role === 'participant')) {
     throw new Error('Введите ссылку вида https://code.avito.ru/r/…')
   }
   if (await getRoom() || (await rtc({ type: 'state' })).state.phase !== 'idle') {
@@ -136,7 +167,8 @@ async function openRoom(role, input) {
   }
 
   const link = existingRoom ?? await createAvitoRoom()
-  const tab = await chrome.tabs.create({ url: link.url })
+  const [active] = existingRoom ? await chrome.tabs.query({ active: true, currentWindow: true }) : []
+  const tab = roomLink(active?.url)?.url === link.url ? active : await chrome.tabs.create({ url: link.url })
   const room = {
     tabId: tab.id,
     url: link.url,
@@ -144,7 +176,10 @@ async function openRoom(role, input) {
     name: await identity,
     id: crypto.randomUUID(),
   }
-  if (role === 'host') room.sessionName = newSessionName()
+  if (role === 'host') {
+    room.sessionName = newSessionName()
+    room.reuse = Boolean(existingRoom)
+  }
 
   await chrome.storage.session.set({ room, roomNote: 'Открываем комнату Avito…' })
   await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['room.js'] }).catch(() => {})
@@ -165,105 +200,148 @@ async function createAvitoRoom() {
   return roomLink('https://code.avito.ru/r/' + room.id)
 }
 
-function declaration(room, host) {
-  return {
-    type: room.role,
-    from: room.name,
-    id: room.id,
-    session: room.sessionName,
-    to: host?.from,
-    hostId: host?.id,
-  }
-}
-
-function selectedParticipant(messages, host) {
-  return messages.find(message => message.type === 'participant' &&
-    message.hostId === host.id && message.session === host.session &&
-    message.to === host.from && message.from !== host.from)
-}
-
-async function beginConnection(room, host, participant) {
+async function beginConnection(room, host) {
+  if ((await getRoom())?.id !== room.id) return
+  if (room.role !== 'host' && room.name === host.from) room.name = newName(host.from)
+  delete room.departedHostId
   room.session = host.session
+  room.hostId = host.id
   await chrome.storage.session.set({ room, roomNote: '' })
   const { turn } = await chrome.storage.session.get('turn')
   await rtc({
     type: 'start',
     session: host.session,
+    hostId: host.id,
     name: room.name,
     host: host.from,
-    partner: room.role === 'host' ? participant.from : host.from,
     turn,
     room: { tabId: room.tabId, url: room.url, name: room.name },
   })
 }
 
-async function enroll(room, snapshot) {
-  const messages = readSignals(snapshot.text)
-  if (room.role === 'host') {
-    const isOwnHost = (message) =>
-      message.type === 'host' && message.session === room.sessionName &&
-      message.from === room.name && message.id === room.id
-    const host = messages.find(isOwnHost)
+async function recordHostLeft(room) {
+  const hostId = room?.hostId ?? (room?.role === 'host' ? room.id : null)
+  const session = room?.session ?? room?.sessionName
+  if (!hostId || !session) return
+  try {
+    const tab = await chrome.tabs.get(room.tabId)
+    if (roomLink(tab.url)?.url !== room.url) return
+    const snapshot = await editor(room.tabId, 'read')
+    if (snapshot.waiting) return
+    const messages = readSignals(snapshot.text, session)
+    if (messages.some(message => message.type === 'hostLeft' && message.hostId === hostId)) return
+    if (!messages.some(message => message.type === 'host' && message.id === hostId)) return
+    await editor(room.tabId, 'append', '\n' + signalLine({
+      type: 'hostLeft', id: crypto.randomUUID(), from: room.name, session, hostId,
+    }))
+  } catch (error) {
+    console.warn(error)
+  }
+}
 
-    if (!host) {
-      if (room.hostWriteRequested) {
-        await chrome.storage.session.set({ roomNote: 'Ожидаем запись Host в комнате…' })
-        return
-      }
+let roomCheck
 
-      // Clearing the room is a one-time action, even if a later read doesn't contain Host.
-      room.hostWriteRequested = true
-      await chrome.storage.session.set({ room, roomNote: 'Ожидаем запись Host в комнате…' })
+function checkRoomAt(room, time) {
+  if (roomCheck?.id === room.id && roomCheck.time <= time) return
+  clearTimeout(roomCheck?.timer)
+  const timer = setTimeout(async () => {
+    roomCheck = null
+    const current = await getRoom()
+    if (current?.id !== room.id || current.error) return
+    if (ticking) checkRoomAt(room, Date.now() + 50)
+    else void tick({ frameId: 0, tab: { id: current.tabId } })
+  }, Math.max(0, time - Date.now()))
+  roomCheck = { id: room.id, timer, time }
+}
 
-      const line = signalLine(declaration(room))
-      const log = isDebuggabel ? debugLine(room.name, 'State changed to Signaling') : ''
-      const result = await editor(room.tabId, 'replace', line + log)
-      if (result.waiting && (await getRoom())?.id === room.id) {
-        delete room.hostWriteRequested
-        await chrome.storage.session.set({ room, roomNote: result.message })
-      }
+async function enrollHost(room, messages) {
+  const host = messages.find(message => message.type === 'host' && message.id === room.id)
+  if (!host) {
+    if (room.hostWriteRequested) return
+    if (messages.some(message => message.type === 'host' && message.session === room.sessionName)) {
+      room.sessionName = room.sessionName.slice(0, 63) + '-' + room.id
+    }
+    room.hostWriteRequested = true
+    await chrome.storage.session.set({ room, roomNote: 'Ожидаем запись Host в комнате…' })
+    const previous = room.reuse ? activeHost(messages) : null
+    const close = previous ? signalLine({
+      type: 'hostLeft', id: crypto.randomUUID(), from: room.name,
+      session: previous.session, hostId: previous.id,
+    }) : ''
+    const line = signalLine({ type: 'host', id: room.id, from: room.name, session: room.sessionName })
+    const log = isDebuggabel ? debugLine(room.name, 'State changed to Signaling') : ''
+    const append = room.reuse || room.election
+    const result = await editor(room.tabId, append ? 'append' : 'replace', (append ? '\n' : '') + close + line + log)
+    if (result.waiting && (await getRoom())?.id === room.id) {
+      delete room.hostWriteRequested
+      await chrome.storage.session.set({ room, roomNote: result.message })
+    }
+    return
+  }
+
+  const active = activeHost(messages)
+  if (active?.id === host.id) return beginConnection(room, host)
+  room.role = 'participant'
+  await enrollParticipant(room, messages)
+}
+
+function activeHost(messages) {
+  let host
+  for (const message of messages) {
+    if (!host && message.type === 'host') host = message
+    else if (message.type === 'hostLeft' && message.hostId === host?.id && message.session === host.session) {
+      host = undefined
+    }
+  }
+  return host
+}
+
+async function waitForHost(room, messages) {
+  const lastElection = messages.findLast(message => ['host', 'hostLeft', 'nominated_host'].includes(message.type))
+  room.election = { after: lastElection?.id, waitUntil: Date.now() + 1000 }
+  await chrome.storage.session.set({ room, roomNote: 'Ожидаем хоста…' })
+  checkRoomAt(room, room.election.waitUntil)
+}
+
+async function enrollParticipant(room, messages) {
+  const host = activeHost(messages)
+  if (host) {
+    if (host.id === room.departedHostId) {
+      return recordHostLeft({ ...room, hostId: host.id, session: host.session })
+    }
+    return beginConnection(room, host)
+  }
+
+  const round = room.election
+  if (!round) return waitForHost(room, messages)
+  if (Date.now() < round.waitUntil) return
+  if (!round.nominationId) {
+    const nominationId = crypto.randomUUID()
+    const result = await editor(room.tabId, 'append', '\n' + signalLine({
+      type: 'nominated_host', id: nominationId, from: room.name,
+    }))
+    if ((await getRoom())?.id !== room.id) return
+    if (result.waiting) {
+      await chrome.storage.session.set({ roomNote: result.message })
       return
     }
-
-    const participant = selectedParticipant(messages, host)
-    if (participant) await beginConnection(room, host, participant)
-    else await chrome.storage.session.set({ roomNote: 'Ожидаем участника. Скопируйте ссылку на комнату.' })
+    round.nominationId = nominationId
+    round.waitUntil = Date.now() + 500
+    await chrome.storage.session.set({ room, roomNote: 'Выбираем хоста…' })
+    checkRoomAt(room, round.waitUntil)
     return
   }
 
-  const visibleHost = readSignals(snapshot.visibleHost ?? '').find(message => message.type === 'host')
-  const host = messages.findLast(message => message.type === 'host') ?? visibleHost
-  if (!host) {
-    const roomNote = snapshot.text.trim() || snapshot.visibleHost
-      ? 'В комнате есть текст, но расширение не распознало запись Host.'
-      : 'Ожидаем хоста… Общий документ пока пуст.'
-    await chrome.storage.session.set({ roomNote })
-    return
-  }
-
-  const participant = selectedParticipant(messages, host)
-  if (participant) {
-    if (participant.id !== room.id) throw new Error('В комнате уже есть участник')
-    await beginConnection(room, host, participant)
-    return
-  }
-
-  const roomNote = 'Хост ' + host.from + ' найден. Ожидаем запись Participant в общей комнате…'
-  if (room.announcedHost === host.id) {
-    await chrome.storage.session.set({ roomNote })
-    return
-  }
-  if (room.name === host.from) room.name = newName(host.from)
-  room.sessionName = host.session
-  room.announcedHost = host.id
-
-  // Persist the announcement before writing so an uncertain response cannot duplicate it.
-  await chrome.storage.session.set({ room, roomNote })
-  const log = isDebuggabel ? debugLine(room.name, 'State changed to Signaling') : ''
-  const result = await editor(room.tabId, 'append', '\n' + signalLine(declaration(room, host)) + log)
-  if (result.waiting) {
-    delete room.announcedHost
-    await chrome.storage.session.set({ room, roomNote: result.message })
+  const after = round.after ? messages.findLastIndex(message => message.id === round.after) : -1
+  const first = messages.slice(after + 1).find(message => message.type === 'nominated_host')
+  if (first?.id === round.nominationId) {
+    room.role = 'host'
+    room.sessionName = newSessionName()
+    await chrome.storage.session.set({ room, roomNote: 'Начинаем новую сессию как хост…' })
+    await enrollHost(room, messages)
+  } else if (Date.now() >= round.waitUntil + 5000) {
+    // The winner may have closed the tab before publishing Host. Start after its nomination.
+    await waitForHost(room, messages)
   }
 }
 
@@ -292,15 +370,17 @@ async function tick(sender) {
     if (!room || room.tabId !== sender.tab.id || room.error) return
 
     const tab = await chrome.tabs.get(room.tabId)
-    if (roomLink(tab.url)?.url !== room.url) return
-    const operation = !room.session && room.role === 'participant' ? 'readForJoin' : 'read'
-    const snapshot = await editor(room.tabId, operation)
+    if (tab.discarded || roomLink(tab.url)?.url !== room.url) return
+    const snapshot = await editor(room.tabId, 'read')
     if (snapshot.waiting) {
       await chrome.storage.session.set({ roomNote: snapshot.message })
       return
     }
-    if (!room.session) await enroll(room, snapshot)
-    else await exchangeSignals(room, snapshot.text)
+    if (!room.session) {
+      const messages = readSignals(snapshot.text)
+      if (room.role === 'host') await enrollHost(room, messages)
+      else await enrollParticipant(room, messages)
+    } else await exchangeSignals(room, snapshot.text)
   } catch (error) {
     if (!room || (await getRoom())?.id !== room.id) return
     if (room.session && (await rtc({ type: 'state' })).state.phase !== 'error') {
@@ -312,6 +392,10 @@ async function tick(sender) {
     await chrome.storage.session.set({ room: { ...room, error: error.message }, roomNote: '' })
   } finally {
     ticking = false
+    if (room?.tabId === sender.tab.id && !room.error) {
+      // The room tab may be backgrounded and its content timer throttled.
+      checkRoomAt(room, Date.now() + 400)
+    }
   }
 }
 
@@ -343,7 +427,7 @@ async function handle(m, sender) {
     }
     if (m.type === 'debugState' || m.type === 'debugSent') {
       const labels = {
-        connection: 'Connection', reconnecting: 'Reconnecting', stable: 'Stable',
+        signaling: 'Signaling', connection: 'Connection', reconnecting: 'Reconnecting', stable: 'Stable',
         streaming: 'Streaming', error: 'Error', idle: 'IDLE',
       }
       let text = m.text
@@ -363,8 +447,16 @@ async function handle(m, sender) {
         const current = (await rtc({ type: 'state' })).state
         if (current.session && current.session !== m.session) return
         const room = await getRoom()
-        if (current.phase === 'idle' && room?.session === m.session) {
-          await chrome.storage.session.remove(['room', 'roomNote'])
+        if (current.phase === 'signaling' && !current.session && room?.session && room.session === m.session) {
+          const waiting = {
+            tabId: room.tabId, url: room.url, name: room.name, role: 'participant',
+            id: crypto.randomUUID(), departedHostId: room.hostId,
+          }
+          await chrome.storage.session.set({ room: waiting, roomNote: 'Ожидаем участника…' })
+          checkRoomAt(waiting, Date.now())
+        } else if (current.phase === 'error' && room?.session && room.session === m.session &&
+            (room.role === 'host' || m.hadAnswer)) {
+          await recordHostLeft(room)
         }
         await chrome.storage.session.remove('warning')
         await clearStreamingTab()
@@ -372,7 +464,7 @@ async function handle(m, sender) {
       return {}
     }
     if (m.type === 'streamStopped' && uuid(m.pageId)) {
-      await runSiteOperation(() => clearStreamingTab(m.pageId))
+      await runSiteOperation(() => clearStreamingTab(m.pageId, m.closeReceiver === true))
       return {}
     }
     if (m.type === 'remoteSite' && uuid(m.pageId)) {
@@ -396,9 +488,9 @@ async function handle(m, sender) {
     return {}
   }
   if (sender.url !== chrome.runtime.getURL('popup.html')) throw new Error('Недопустимый источник')
-  if (m.type === 'create') await openRoom('host')
-  else if (m.type === 'join') await openRoom('participant', m.url)
-  else if (m.type === 'capture') {
+  if (m.type === 'create' || m.type === 'join') {
+    await runSiteOperation(() => openRoom(m.type === 'create' ? 'host' : 'participant', m.url))
+  } else if (m.type === 'capture') {
     await chrome.storage.session.remove('warning')
     await shareActivePage().catch(async error => {
       await chrome.storage.session.set({ warning: error.message })
@@ -407,12 +499,10 @@ async function handle(m, sender) {
   } else if (m.type === 'pause') {
     await runSiteOperation(async () => {
       const { state } = await rtc({ type: 'state' })
-      if (state.stream) await stopStreaming({ ...state.stream, session: state.session })
+      if (state.stream) await stopStreaming({ ...state.stream, session: state.session }, undefined, true)
     })
-  } else if (m.type === 'disconnect') {
-    await chrome.storage.session.remove(['room', 'roomNote'])
-    await rtc(m)
-  } else if (m.type !== 'state') throw new Error('Неизвестная команда')
+  } else if (m.type === 'disconnect') await runSiteOperation(disconnectRoom)
+  else if (m.type !== 'state') throw new Error('Неизвестная команда')
   const stored = await chrome.storage.session.get(['streamingTab', 'warning', 'room', 'roomNote'])
   const { state } = await rtc({ type: 'state' })
   if (stored.room?.error) {
@@ -432,26 +522,36 @@ chrome.runtime.onMessage.addListener((m, sender, respond) => {
   )
   return true
 })
-chrome.tabs.onRemoved.addListener(async (tabId) => {
-  const room = await getRoom()
-  if (room?.tabId === tabId) {
-    await chrome.storage.session.remove(['room', 'roomNote'])
-    await rtc({ type: 'disconnect' }).catch(() => {})
-  }
+chrome.tabs.onRemoved.addListener((tabId) => {
   void runSiteOperation(async () => {
-    const site = await getStreamingTab()
-    if (site?.tabId === tabId) await stopStreaming(site)
+    const [room, site] = await Promise.all([getRoom(), getStreamingTab()])
+    if (room?.tabId === tabId || site?.tabId === tabId) await disconnectRoom()
   }).catch(console.warn)
 })
 chrome.tabs.onUpdated.addListener((tabId, change) => {
-  if (!change.status && !change.url) return
+  if (!change.status && !change.url && change.discarded === undefined) return
   void runSiteOperation(() => updateStreamingTab(tabId)).catch(console.warn)
 })
-chrome.debugger.onDetach.addListener(({ tabId }) => {
+chrome.tabs.onReplaced.addListener((addedTabId, removedTabId) => {
+  void runSiteOperation(async () => {
+    const [room, site] = await Promise.all([getRoom(), getStreamingTab()])
+    if (room?.tabId === removedTabId) {
+      const replacement = { ...room, tabId: addedTabId }
+      await chrome.storage.session.set({ room: replacement })
+      checkRoomAt(replacement, Date.now())
+    }
+    if (site?.tabId === removedTabId) {
+      await suspendStreamingTab(site, addedTabId)
+      await updateStreamingTab(addedTabId)
+    }
+  }).catch(console.warn)
+})
+chrome.debugger.onDetach.addListener(({ tabId }, reason) => {
   void runSiteOperation(async () => {
     const site = await getStreamingTab()
     if (site?.tabId === tabId && site.attached) {
-      await stopStreaming(site, 'Chrome отключил отладчик. Стриминг приостановлен.')
+      if (reason === 'target_closed') await suspendStreamingTab(site)
+      else await stopStreaming(site, 'Chrome отключил отладчик. Стриминг приостановлен.')
     }
   }).catch(console.warn)
 })

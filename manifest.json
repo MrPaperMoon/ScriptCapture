@@ -5,10 +5,10 @@
   "minimum_chrome_version": "125",
   "description": "Совместный просмотр через страниц с помощью p2p соединения",
   "icons": {
-    "16": "icons/tv_gen_18dp_1F1F1F_FILL0_wght400_GRAD0_opsz20.png",
-    "32": "icons/tv_gen_32dp_1F1F1F_FILL0_wght400_GRAD0_opsz40.png",
-    "48": "icons/tv_gen_48dp_1F1F1F_FILL0_wght400_GRAD0_opsz48.png",
-    "128": "icons/tv_gen_128dp_1F1F1F_FILL0_wght400_GRAD0_opsz48.png"
+    "16": "icons/smart-display-16.png",
+    "32": "icons/smart-display-32.png",
+    "48": "icons/smart-display-48.png",
+    "128": "icons/smart-display-128.png"
   },
   "permissions": [
     "offscreen",
@@ -26,7 +26,11 @@
     "type": "module"
   },
   "action": {
-    "default_popup": "popup.html"
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/smart-display-16.png",
+      "32": "icons/smart-display-32.png"
+    }
   },
   "content_security_policy": {
     "extension_pages": "script-src 'self'; object-src 'none'; frame-src 'self'",

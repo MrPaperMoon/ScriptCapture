@@ -1,13 +1,13 @@
 const MAX_TEXT = 1000000
 const COMMANDS = new Map([
   ['host', 'Host'],
-  ['participant', 'Participant'],
+  ['hostLeft', 'HostLeft'],
+  ['nominated_host', 'nominated_host'],
   ['offer', 'Offer'],
   ['answer', 'Answer'],
   ['ice', 'Ice'],
   ['restart', 'Restart'],
   ['reconnect', 'Reconnect'],
-  ['hello', 'Hello'],
 ])
 const TYPES = new Map([...COMMANDS].map(([type, label]) => [label, type]))
 
@@ -38,7 +38,8 @@ export function roomLink(url) {
 }
 
 export function signalLine(message) {
-  const fields = ['message_id=' + message.id, 'session=' + message.session]
+  const fields = ['message_id=' + message.id]
+  if (message.session) fields.push('session=' + message.session)
   if (message.to) fields.push('to=' + encodeURIComponent(message.to))
   if (message.hostId) fields.push('host_id=' + message.hostId)
   if (message.generation) fields.push('generation=' + message.generation)
@@ -57,7 +58,13 @@ export function readSignals(text, session) {
   // Monaco in Avito uses CRLF. Strip the terminator before matching the command.
   for (const rawLine of text.split(/\r?\n/)) {
     if (rawLine.length > 100000) continue
-    const header = /^\[([^\]]+)\]\s+([A-Za-z]+)\s*:\s+(.+)$/.exec(rawLine.trim())
+    const legacyBye = /^\/\/\s*\[([^\]]+)\]\s+Sent bye\s*$/.exec(rawLine)
+    if (legacyBye) {
+      const host = messages.findLast(message => message.type === 'host' && message.from === legacyBye[1])
+      if (host) messages.push({ ...host, type: 'hostLeft', hostId: host.id })
+      continue
+    }
+    const header = /^\[([^\]]+)\]\s+([A-Za-z_]+)\s*:\s+(.+)$/.exec(rawLine.trim())
     if (!header || !isName(header[1])) continue
     const [, from, label, body] = header
     const type = TYPES.get(label)
@@ -69,14 +76,16 @@ export function readSignals(text, session) {
       const fields = new Map(metadata.split(/\s+/).map(field => field.split('=')))
       if (!uuid(fields.get('message_id'))) continue
       const name = fields.get('session')
-      if (!isSessionName(name) || (session && name !== session)) continue
+      const election = type === 'nominated_host'
+      if ((!election || name !== undefined) && !isSessionName(name)) continue
+      if (session && name !== session) continue
       const to = fields.has('to') ? decodeURIComponent(fields.get('to')) : null
-      if (type !== 'host' && !isName(to)) continue
+      if (!['host', 'hostLeft', 'nominated_host'].includes(type) && !isName(to)) continue
       const generation = Number(fields.get('generation') ?? 0)
       if (!Number.isSafeInteger(generation) || generation < 0) continue
 
       const message = { type, from, to, session: name, id: fields.get('message_id'), generation }
-      if (type === 'participant') {
+      if (type === 'hostLeft') {
         message.hostId = fields.get('host_id')
         if (!uuid(message.hostId)) continue
       }

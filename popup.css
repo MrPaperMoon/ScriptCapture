@@ -22,7 +22,6 @@ header {
   display: grid;
   place-items: center;
   background: #a5ebc8;
-  color: #142c23;
   border-radius: 12px;
   width: 44px;
   height: 44px;
@@ -106,6 +105,9 @@ p {
 }
 #error {
   color: #ffb0a9;
+}
+#roomNote:empty {
+  display: none;
 }
 [hidden] {
   display: none !important;
